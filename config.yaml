@@ -1,0 +1,44 @@
+# security-forge — active config for THIS copy. Set target.repo before the first run.
+# See config.example.yaml for all options and comments.
+
+target:
+  repo: ""            # set the target repo URL, or pass it via SECFORGE_TARGET_REPO
+  branch: ""          # default branch
+  depth: 1            # shallow clone: baseline static analysis doesn't need full history
+
+analysis:
+  focus:
+    - authentication / authorization
+    - input validation / injection (SQLi, command, template, deserialization)
+    - SSRF / path traversal / file upload
+    - secrets & credential handling
+    - insecure crypto & session management
+    - access control / IDOR
+  changed_only_after_first_scan: true
+  max_verify_per_cycle: 3
+  max_analyzer_agents: 6
+  # Only user-reachable, exploitable AND valuable issues count. Never record
+  # theoretical / best-practice noise (bare MD5, missing headers, etc.).
+  only_exploitable_valuable: true
+  user_reachable_only: true
+
+report:
+  # Hard floor — MEDIUM/HIGH/CRITICAL are recorded and emitted; nothing below.
+  # The confirmation standard does NOT soften as severity drops: a MEDIUM must be
+  # as well-evidenced as a CRITICAL (confirmed, traced to the sink, user-reachable,
+  # concrete impact, FP filter named). MEDIUM = the attacker's precondition,
+  # never the analyst's uncertainty.
+  min_severity: MEDIUM
+  send_verified: true
+  send_high_sev_unverified: true
+  min_severity_unverified: MEDIUM
+  executive_summary: true        # per-target EXECUTIVE_SUMMARY.md, refreshed each cycle
+  cycle_summary: true
+  attach_report_file: true
+  progress: true                 # emit per-phase progress lines so you can watch a run
+  progress_silent: true          # …tagged as progress (not a finding/summary notice)
+
+verify:
+  enabled: true
+  network_egress: true
+  boot_timeout_seconds: 120

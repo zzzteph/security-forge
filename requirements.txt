@@ -1,0 +1,4 @@
+# security-forge runtime deps (deliberately minimal).
+# docker + all HTTP use the Python stdlib, so only YAML config parsing needs a
+# third-party package.
+PyYAML>=6.0

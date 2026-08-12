@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace-manifest.json",
+  "name": "security-forge",
+  "description": "Agentic security / bug-bounty audit pipeline for Claude Code.",
+  "owner": {
+    "name": "zzzteph",
+    "url": "https://github.com/zzzteph"
+  },
+  "plugins": [
+    {
+      "name": "security-forge",
+      "source": "./",
+      "version": "0.5.0",
+      "description": "Builds a durable model of a target repo, hunts real reachable vulnerabilities, verifies them by running the app in a container, and reports locally.",
+      "category": "security",
+      "keywords": [
+        "security",
+        "bug-bounty",
+        "appsec",
+        "vulnerability",
+        "audit"
+      ]
+    }
+  ]
+}

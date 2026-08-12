@@ -1,0 +1,154 @@
+# security-forge — agentic security analysis, driven from GitHub Actions.
+#
+# ONE entry point: give it a repo URL, it does the trick (auto baseline the first
+# time, incremental after — reusing the durable model on branch model/<slug>).
+#
+# NOTIFY-ONLY: this runs in the SECFORGE repo, not as a check inside the target's
+# PR, so it can never block or "raise" anything on that PR. It reports locally
+# (to the run log + notifications.log). Every step is resilient; the job never
+# fails a PR.
+#
+# Triggers:
+#   • workflow_dispatch  — run manually with a repo (+ optional PR ref).
+#   • repository_dispatch (type: security-forge-pr) — a 5-line hook in a target repo can
+#     fire this on pull_request (see docs/WORKFLOW.md). client_payload: {repo, ref, pr}.
+#   • schedule           — periodic sweep of vars.SECFORGE_DEFAULT_REPO.
+#
+# Required secrets:  ANTHROPIC_API_KEY
+# Optional vars:     SECFORGE_DEFAULT_REPO (for schedule), SECFORGE_MODEL (e.g. opus)
+#
+# Cloning the target is plain `git clone` (done by the workflow's own steps). A
+# PUBLIC target needs nothing. For a PRIVATE target, configuring git auth on the
+# runner is YOUR responsibility (add a step that sets a credential / git config),
+# exactly as it is your responsibility locally — security-forge does not manage it.
+# NOTE: GitHub Actions is OPTIONAL. The default is to run locally from the Claude
+# console (see opt/workflow.md); this file is here only if you want CI too.
+
+name: security-forge-analyze
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Target repo URL (https://github.com/owner/repo[.git])"
+        required: true
+      ref:
+        description: "Optional PR ref / branch / sha to focus on"
+        required: false
+      pr:
+        description: "Optional PR number (for the notification)"
+        required: false
+  repository_dispatch:
+    types: [security-forge-pr]
+  schedule:
+    - cron: "0 */12 * * *"   # every 12h; adjust or remove as you like
+
+concurrency:
+  # serialize per-target so two runs never fight over the model branch
+  group: security-forge-${{ github.event.inputs.repo || github.event.client_payload.repo || vars.SECFORGE_DEFAULT_REPO }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # to push the model/<slug> persistence branch (THIS repo only)
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout security-forge
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # need history to fetch/create the model branch
+          persist-credentials: true
+
+      - name: Resolve target repo + ref (clean URL only — no token here)
+        id: t
+        run: |
+          set -e
+          case "${{ github.event_name }}" in
+            workflow_dispatch)   REPO="${{ github.event.inputs.repo }}";         REF="${{ github.event.inputs.ref }}";         PR="${{ github.event.inputs.pr }}" ;;
+            repository_dispatch)  REPO="${{ github.event.client_payload.repo }}";  REF="${{ github.event.client_payload.ref }}";  PR="${{ github.event.client_payload.pr }}" ;;
+            *)                    REPO="${{ vars.SECFORGE_DEFAULT_REPO }}";          REF="";                                       PR="" ;;
+          esac
+          if [ -z "$REPO" ]; then echo "No target repo resolved; nothing to do."; echo "skip=1" >> "$GITHUB_OUTPUT"; exit 0; fi
+          SLUG="$(python3 -c "import sys;sys.path.insert(0,'scripts');import common;print(common.target_slug(sys.argv[1]))" "$REPO")"
+          SLUG_FLAT="$(printf '%s' "$SLUG" | tr '/' '-')"
+          {
+            echo "repo=$REPO"
+            echo "ref=$REF"
+            echo "pr=$PR"
+            echo "slug=$SLUG"
+            echo "slug_flat=$SLUG_FLAT"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resolved target slug: $SLUG"
+
+      - name: Set up Python
+        if: steps.t.outputs.skip != '1'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Set up Node (for Claude Code CLI)
+        if: steps.t.outputs.skip != '1'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install deps (PyYAML + Claude Code CLI)
+        if: steps.t.outputs.skip != '1'
+        run: |
+          python3 -m pip install --quiet -r requirements.txt
+          npm install -g @anthropic-ai/claude-code
+
+      - name: Restore durable model (branch model/<slug>)
+        if: steps.t.outputs.skip != '1'
+        run: bash scripts/model_branch.sh restore "${{ steps.t.outputs.slug }}"
+
+      - name: Run the analysis (follow opt/workflow.md) — never fails the PR
+        if: steps.t.outputs.skip != '1'
+        continue-on-error: true          # notify-only: analysis problems never break anything
+        id: run
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SECFORGE_TARGET_REPO: ${{ steps.t.outputs.repo }}     # git clone uses the runner's own git/creds
+        run: |
+          set +e
+          mkdir -p logs
+          FOCUS=""
+          [ -n "${{ steps.t.outputs.ref }}" ] && FOCUS=" Focus on ref ${{ steps.t.outputs.ref }}."
+          [ -n "${{ steps.t.outputs.pr }}" ]  && FOCUS="$FOCUS Report it as PR #${{ steps.t.outputs.pr }}."
+          MODEL_FLAG=""
+          [ -n "${{ vars.SECFORGE_MODEL }}" ] && MODEL_FLAG="--model ${{ vars.SECFORGE_MODEL }}"
+          PROMPT="Follow opt/workflow.md to run exactly one full security analysis cycle against ${{ steps.t.outputs.repo }}.${FOCUS} Work fully non-interactively: never ask questions, honour the notify-only guardrail (never block or raise a PR — local report only), and finish by tearing down the docker sandbox."
+          claude -p "$PROMPT" $MODEL_FLAG --dangerously-skip-permissions 2>&1 | tee "logs/ci-${{ steps.t.outputs.slug_flat }}.log"
+          exit 0
+
+      - name: Persist updated model (push model/<slug>)
+        if: steps.t.outputs.skip != '1'
+        continue-on-error: true
+        run: bash scripts/model_branch.sh save "${{ steps.t.outputs.slug }}"
+
+      - name: Always tear down the Docker sandbox
+        if: always() && steps.t.outputs.skip != '1'
+        continue-on-error: true
+        env:
+          SECFORGE_TARGET_REPO: ${{ steps.t.outputs.repo }}
+        run: python3 scripts/pipeline.py nuke || true
+
+      - name: Record infrastructure failure locally (still never fails the PR)
+        if: always() && steps.run.outcome == 'failure'
+        continue-on-error: true
+        env:
+          SECFORGE_TARGET_REPO: ${{ steps.t.outputs.repo }}
+        run: |
+          python3 scripts/pipeline.py notify "security-forge CI: analysis run errored for ${{ steps.t.outputs.slug }} (see Actions logs). No PR impact." || true
+
+      - name: Upload run log
+        if: always() && steps.t.outputs.skip != '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-forge-log-${{ steps.t.outputs.slug_flat }}
+          path: logs/
+          if-no-files-found: ignore
+          retention-days: 14

@@ -1,0 +1,29 @@
+# Secrets & per-copy config values
+.env
+
+# Cloned target repository (re-created on each run)
+/target/
+
+# Pipeline state & scratch
+/state/
+/logs/
+/reports/
+
+<<<<<<< Updated upstream
+# Knowledge docs (generated per run)
+=======
+# Per-target models, findings, advisories, PoCs (persisted to model/<slug> in CI, not main)
+>>>>>>> Stashed changes
+/knowledge/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

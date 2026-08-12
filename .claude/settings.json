@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python scripts/pipeline.py:*)",
+      "Bash(python scripts/verify.py:*)",
+      "Bash(python:*)",
+      "Bash(git:*)",
+      "Bash(docker:*)",
+      "Bash(docker compose:*)",
+      "Bash(rg:*)",
+      "Bash(grep:*)",
+      "PowerShell(python scripts/pipeline.py:*)",
+      "PowerShell(python scripts/verify.py:*)",
+      "PowerShell(python:*)",
+      "PowerShell(git:*)",
+      "PowerShell(docker:*)",
+      "Bash(git status *)",
+      "Bash(git grep *)"
+    ],
+    "deny": [],
+  },
+  "_comment": "This pipeline is designed to run headless with --dangerously-skip-permissions, which bypasses these rules entirely. The allowlist only matters if you run it interactively without that flag: it pre-approves the pipeline's own commands so you are not prompted for every docker/git/python call. It intentionally does NOT allow arbitrary shell."
+}

@@ -1,0 +1,51 @@
+# security-forge — per-target configuration.
+# Copy this file to config.yaml (in THIS folder) and set your target.
+# Each copy of the security-forge folder analyzes exactly one target repo.
+
+target:
+  # GitHub (or any git) URL to clone into ./target and analyze.
+  # For private repos use an authenticated URL, e.g.
+  #   https://<user>:<token>@github.com/owner/repo.git
+  repo: ""                       # e.g. https://github.com/owner/repo.git
+  branch: ""                     # blank = default branch
+  depth: null                    # null = full history (needed for secret scanning); or an int for shallow
+
+analysis:
+  # How aggressive the agentic pass is. The skill reads these.
+  focus:                         # optional: bias analysis toward these areas
+    - authentication / authorization
+    - input validation / injection (SQLi, command, template, deserialization)
+    - SSRF / path traversal / file upload
+    - secrets & credential handling
+    - insecure crypto & session management
+    - access control / IDOR
+  changed_only_after_first_scan: true   # after the first full scan, focus on changed files each cycle
+  max_verify_per_cycle: 3        # cap dynamic-verification attempts per cycle (cost/time guard)
+  max_analyzer_agents: 6         # cap concurrent code-analyzer subagents
+  only_exploitable_valuable: true  # ignore theoretical/best-practice noise (bare MD5, headers, …)
+  user_reachable_only: true        # only analyze sinks reachable from a user-facing entry point
+
+report:
+  # Local delivery policy — NOTIFY ONLY (stdout + notifications.log).
+  # MEDIUM/HIGH/CRITICAL are recorded and emitted; nothing below ever is.
+  # The confirmation standard does NOT soften as severity drops — a MEDIUM must be
+  # as well-evidenced as a CRITICAL (confirmed in code, traced to the sink,
+  # user-reachable, concrete impact, false-positive filter named). MEDIUM describes
+  # the attacker's precondition, never the analyst's uncertainty.
+  # Advisories + PoC bundles: verified HIGH/CRITICAL only. MEDIUMs are delivered via
+  # the notification channel and the per-repo EXECUTIVE_SUMMARY.md.
+  min_severity: MEDIUM           # hard floor for recording/reporting anything
+  send_verified: true            # emit as soon as reachability/repro is confirmed
+  send_high_sev_unverified: true # also flag candidates awaiting/failing verification
+  min_severity_unverified: MEDIUM # threshold for the "unverified candidate" alerts
+  executive_summary: true        # per-target EXECUTIVE_SUMMARY.md, rewritten each cycle
+  cycle_summary: true            # emit a one-line summary each cycle
+  attach_report_file: true       # reference a markdown report file for confirmed findings
+  progress: true                 # emit per-phase progress lines so you can watch a run live
+  progress_silent: true          # …tagged as progress (not a finding/summary notice)
+
+verify:
+  # Dynamic-verification sandbox behavior.
+  enabled: true
+  network_egress: true           # allow the target container to reach the internet (often needed to boot)
+  boot_timeout_seconds: 120

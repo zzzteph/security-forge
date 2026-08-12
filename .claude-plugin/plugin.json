@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "security-forge",
+  "description": "Agentic security / bug-bounty audit pipeline: builds a durable model of a target repo, hunts real reachable vulnerabilities, verifies them by running the app in a container, and reports locally (never blocks or touches PRs).",
+  "version": "0.5.0",
+  "author": {
+    "name": "zzzteph",
+    "url": "https://github.com/zzzteph"
+  },
+  "homepage": "https://github.com/zzzteph/security-forge",
+  "repository": "https://github.com/zzzteph/security-forge",
+  "keywords": [
+    "security",
+    "bug-bounty",
+    "appsec",
+    "vulnerability",
+    "audit",
+    "sast",
+    "idor",
+    "authorization"
+  ],
+  "skills": "./.claude/skills/",
+  "agents": [
+    "./.claude/agents/authz-analyzer.md",
+    "./.claude/agents/code-analyzer.md",
+    "./.claude/agents/finding-verifier.md",
+    "./.claude/agents/recon-cartographer.md"
+  ]
+}
