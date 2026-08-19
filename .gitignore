@@ -9,12 +9,15 @@
 /logs/
 /reports/
 
-<<<<<<< Updated upstream
-# Knowledge docs (generated per run)
-=======
-# Per-target models, findings, advisories, PoCs (persisted to model/<slug> in CI, not main)
->>>>>>> Stashed changes
+# Per-target models/findings/advisories/PoCs (regenerated each run; the durable
+# cross-repo store is the committed DB below, not this folder)
 /knowledge/
+
+# The SQLite DB (db/security-forge.db) IS committed on purpose — it's the org-wide
+# "knowledge of all repos" store. Ignore only its transient journal sidecars.
+/db/*.db-wal
+/db/*.db-shm
+/db/*.db-journal
 
 # Python
 __pycache__/

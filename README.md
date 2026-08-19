@@ -58,3 +58,18 @@ repeat runs surface only new bugs and one-time "fixed" notices.
 One copy of this folder can track many targets. State is separated per repo via
 `SECFORGE_TARGET_REPO`. Run `python scripts/pipeline.py paths` to see where a
 target lands on disk.
+
+## Scan a whole org
+
+There's an orchestrator that runs the workflow across every repo in a GitHub org
+and stores the results in a committed SQLite DB (`db/security-forge.db`), so one
+copy of security-forge becomes the durable memory of your whole org. It launches
+one isolated, timeout-bounded Claude session per repo and is fully resumable.
+
+```bash
+python orchestrate.py --org my-org            # analyze every repo not done yet
+python orchestrate.py --org my-org --rescan   # re-sync and re-analyze only the diffs
+```
+
+Put a `GITHUB_TOKEN` in `.env` for private repos. Details, flags, and how to query
+the DB are in [docs/ORCHESTRATION.md](docs/ORCHESTRATION.md).

@@ -1,2 +1,6 @@
-# Auto detect text files and perform LF normalization
+# Normalize text line endings across platforms.
 * text=auto
+
+# The committed SQLite DB is binary — never text-merge or line-diff it.
+*.db binary
+db/security-forge.db binary
