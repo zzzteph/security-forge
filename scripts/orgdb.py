@@ -13,8 +13,9 @@ Two tables:
             tagged with the repo slug + the commit it was found in. Mirrors each
             target's findings.json into one place for cross-repo querying.
 
-The DB lives at db/security-forge.db under DATA_ROOT (durable, NOT gitignored) so
-it persists between runs and can be committed as the project's memory — the
+The DB lives at db/security-forge.db under DATA_ROOT. It is a LOCAL store
+(gitignored — it holds real target names/findings) that persists between runs and
+is auto-created on first use, so a fresh clone needs no committed DB. It is the
 "knowledge of all repos" in one file.
 
 CLI:

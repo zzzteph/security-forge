@@ -13,11 +13,9 @@
 # cross-repo store is the committed DB below, not this folder)
 /knowledge/
 
-# The SQLite DB (db/security-forge.db) IS committed on purpose — it's the org-wide
-# "knowledge of all repos" store. Ignore only its transient journal sidecars.
-/db/*.db-wal
-/db/*.db-shm
-/db/*.db-journal
+# The SQLite DB is a LOCAL scan store — it holds real target org/repo names and
+# findings, so it is NOT committed (keeps internal data out of the repo/history).
+/db/
 
 # Python
 __pycache__/

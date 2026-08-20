@@ -6,13 +6,60 @@ hit an interactive merge prompt (the clone is a read-only analysis mirror).
 """
 from __future__ import annotations
 
+import os
+import re
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import TARGET_DIR, STATE_DIR, run, eprint, target_repo  # noqa: E402
+from common import TARGET_DIR, STATE_DIR, run, eprint, target_repo, load_env  # noqa: E402
 
 LAST_COMMIT = STATE_DIR / "last_commit.txt"
+
+_GH_COM = {"github.com", "www.github.com"}
+
+
+def _host_of(url: str) -> str:
+    s = (url or "").strip()
+    if "://" in s:
+        s = s.split("://", 1)[1]
+    if "@" in s:
+        s = s.split("@", 1)[1]
+    return s.split("/", 1)[0].split(":", 1)[0]
+
+
+def _token_for(host: str) -> str:
+    """Same per-host token resolution as scripts/org.py: a host-specific var
+    wins, then the generic enterprise token, then classic GITHUB_TOKEN/GH_TOKEN."""
+    load_env()
+    cands = ["GITHUB_TOKEN_" + re.sub(r"[^A-Za-z0-9]", "_", host).upper()]
+    if host not in _GH_COM:
+        cands += ["GHE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"]
+    cands += ["GITHUB_TOKEN", "GH_TOKEN"]
+    for name in cands:
+        v = (os.environ.get(name) or "").strip()
+        if v:
+            return v
+    return ""
+
+
+def _authed_url(url: str) -> str:
+    """Inject a token into an https clone URL for private repos. Leaves URLs that
+    already carry credentials, ssh URLs, and token-less hosts untouched. The
+    clone is disposable and nuked after each session, so the credential living in
+    .git/config for its lifetime is acceptable."""
+    s = (url or "").strip()
+    if not s.startswith("https://") or "@" in s.split("://", 1)[1].split("/", 1)[0]:
+        return s
+    tok = _token_for(_host_of(s))
+    if not tok:
+        return s
+    return "https://x-access-token:" + tok + "@" + s[len("https://"):]
+
+
+def _git_env() -> dict:
+    """Never hang an unattended clone on a credential prompt — fail fast instead."""
+    return {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}
 
 SKIP_DIRS = {".git", "node_modules", "vendor", "dist", "build", ".venv", "venv",
              "__pycache__", ".next", "target", ".gradle", ".idea"}
@@ -34,7 +81,7 @@ COMPOSE_NAMES = {"docker-compose.yml", "docker-compose.yaml", "compose.yml", "co
 def git(args, cwd=TARGET_DIR):
     if cwd and not Path(cwd).exists():
         return 128, "", f"cwd does not exist: {cwd}"
-    return run(["git", *args], cwd=cwd)
+    return run(["git", *args], cwd=cwd, env=_git_env())
 
 
 def current_commit() -> str | None:
@@ -76,10 +123,11 @@ def clone_or_update(cfg: dict) -> dict:
             args += ["--depth", str(depth)]
         if branch:
             args += ["--branch", branch]
-        args += [url, str(TARGET_DIR)]
-        rc, _, err = run(["git", *args])
+        args += [_authed_url(url), str(TARGET_DIR)]
+        rc, _, err = run(["git", *args], env=_git_env())
         if rc != 0:
-            raise SystemExit(f"[repo] clone failed: {err}")
+            # Don't leak an injected token if the URL is echoed back in the error.
+            raise SystemExit(f"[repo] clone failed: {re.sub(r'x-access-token:[^@]+@', 'x-access-token:***@', err)}")
     else:
         eprint("[repo] updating existing clone")
         git(["fetch", "--all", "--prune", "--tags"])
