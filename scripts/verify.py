@@ -16,8 +16,9 @@ often need it to boot); set --no-egress to cut it.
 
 CLI:
     python scripts/verify.py net-up
+    python scripts/verify.py pull   --image kartoza/geoserver:2.26.0   # pre-pull a big base image (long timeout)
     python scripts/verify.py build  --tag app --path target [--file target/Dockerfile]
-    python scripts/verify.py run    --image app --name web --port 8080:8080 [--env K=V ...] [--no-egress]
+    python scripts/verify.py run    --image app --name web --port 8080:8080 [--env K=V ...] [--no-egress] [--no-pull]
     python scripts/verify.py compose-up   [--file target/docker-compose.yml]
     python scripts/verify.py probe  --url http://127.0.0.1:8080/ [--method GET] [--data '...'] [--header 'K: V' ...]
     python scripts/verify.py logs   --name web [--tail 200]
@@ -74,11 +75,40 @@ def build(tag: str, path: str = "target", dockerfile: str | None = None) -> dict
     return {"image": image, "ok": rc == 0, "log_tail": (err or out)[-1500:]}
 
 
+def _resolve_image(image: str) -> str:
+    """Map an image arg to the ref docker will run: a bare local build name gets
+    the `security-forge_` prefix; an already-prefixed name or a real registry ref
+    (has a ':' tag or a '/' path) is used as-is."""
+    if image.startswith(PREFIX):
+        return image
+    return image if (":" in image or "/" in image) else f"{PREFIX}{image}"
+
+
+def pull(image: str) -> dict:
+    """Pre-pull an EXTERNAL image with a generous timeout. A large public base
+    image (a full app image like a database or a GeoServer distribution) can take
+    minutes to fetch; doing it here — rather than implicitly inside `run` — means
+    the pull is not bounded by the short container-start timeout and won't get
+    killed half-way. Local `security-forge_*` build tags have nothing to pull."""
+    ref = _resolve_image(image)
+    if ref.startswith(PREFIX):
+        return {"image": ref, "pulled": False, "reason": "local build tag"}
+    rc, out, err = run([CONTAINER_CLI, "pull", ref], timeout=3600)
+    return {"image": ref, "pulled": rc == 0, "log_tail": (err or out)[-1200:]}
+
+
 def run_container(image: str, name: str, ports: list[str], envs: list[str],
-                  no_egress: bool = False) -> dict:
+                  no_egress: bool = False, no_pull: bool = False) -> dict:
     net_up(internal=no_egress)
     full = f"{PREFIX}{name}"
     run([CONTAINER_CLI, "rm", "-f", full])
+    ref = _resolve_image(image)
+    # Pre-pull external images on a long timeout so a big fetch isn't counted
+    # against (and killed by) the container-start timeout below. Cached across
+    # runs — `nuke` removes containers + the network, never images — so only the
+    # first target that needs an image pays for the pull.
+    if not ref.startswith(PREFIX) and not no_pull:
+        pull(ref)
     cmd = [
         CONTAINER_CLI, "run", "-d", "--name", full,
         "--network", NET,
@@ -91,9 +121,8 @@ def run_container(image: str, name: str, ports: list[str], envs: list[str],
         cmd += ["-p", f"127.0.0.1:{host}:{cont}"]
     for e in envs:
         cmd += ["-e", e]
-    cmd.append(image if image.startswith(PREFIX) else f"{PREFIX}{image}"
-               if not (":" in image or "/" in image) else image)
-    rc, out, err = run(cmd, timeout=300)
+    cmd.append(ref)
+    rc, out, err = run(cmd, timeout=600)
     return {"name": full, "ok": rc == 0, "id": out.strip()[:12], "error": err.strip()[:400]}
 
 
@@ -196,9 +225,11 @@ def main() -> None:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("net-up")
+    p = sub.add_parser("pull"); p.add_argument("--image", required=True)
     p = sub.add_parser("build"); p.add_argument("--tag", required=True); p.add_argument("--path", default="target"); p.add_argument("--file")
     p = sub.add_parser("run"); p.add_argument("--image", required=True); p.add_argument("--name", required=True)
     p.add_argument("--port", action="append", default=[]); p.add_argument("--env", action="append", default=[]); p.add_argument("--no-egress", action="store_true")
+    p.add_argument("--no-pull", action="store_true", help="skip the pre-pull (image is already local)")
     p = sub.add_parser("compose-up"); p.add_argument("--file")
     p = sub.add_parser("compose-down"); p.add_argument("--file")
     p = sub.add_parser("probe"); p.add_argument("--url", required=True); p.add_argument("--method", default="GET")
@@ -212,10 +243,12 @@ def main() -> None:
     a = ap.parse_args()
     if a.cmd == "net-up":
         _out(net_up())
+    elif a.cmd == "pull":
+        _out(pull(a.image))
     elif a.cmd == "build":
         _out(build(a.tag, a.path, a.file))
     elif a.cmd == "run":
-        _out(run_container(a.image, a.name, a.port, a.env, a.no_egress))
+        _out(run_container(a.image, a.name, a.port, a.env, a.no_egress, a.no_pull))
     elif a.cmd == "compose-up":
         _out(compose_up(a.file))
     elif a.cmd == "compose-down":

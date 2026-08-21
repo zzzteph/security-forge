@@ -16,7 +16,12 @@ analysis:
     - access control / IDOR
   changed_only_after_first_scan: true
   max_verify_per_cycle: 3
-  max_analyzer_agents: 6
+  max_recon_agents: 3            # cap parallel recon-cartographers (large-repo fan-out guard)
+  max_authz_agents: 4           # cap parallel authz-analyzers (area agents + auth-mechanism)
+  max_analyzer_agents: 6        # cap parallel code-analyzer (dataflow) subagents
+  # On a very large repo, DON'T try to fully analyze + verify in one cycle: cap
+  # fan-out to these budgets, cover the highest-value areas first, record partial
+  # coverage, and let the next (incremental) cycle continue from the persisted model.
   # Only user-reachable, exploitable AND valuable issues count. Never record
   # theoretical / best-practice noise (bare MD5, missing headers, etc.).
   only_exploitable_valuable: true

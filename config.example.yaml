@@ -21,7 +21,14 @@ analysis:
     - access control / IDOR
   changed_only_after_first_scan: true   # after the first full scan, focus on changed files each cycle
   max_verify_per_cycle: 3        # cap dynamic-verification attempts per cycle (cost/time guard)
-  max_analyzer_agents: 6         # cap concurrent code-analyzer subagents
+  max_recon_agents: 3            # cap concurrent recon-cartographer subagents (large-repo fan-out guard)
+  max_authz_agents: 4            # cap concurrent authz-analyzer subagents (area agents + the auth-mechanism agent)
+  max_analyzer_agents: 6         # cap concurrent code-analyzer (dataflow) subagents
+  # Large-repo strategy: these caps bound EACH phase's fan-out. A session runs under
+  # a hard wall-clock deadline (orchestrate.py --timeout, default 1h), so on a big
+  # codebase do NOT attempt exhaustive coverage in one cycle — cap fan-out here,
+  # analyze the highest-value areas first, record partial coverage, and let the next
+  # incremental cycle continue from the persisted knowledge/ model.
   only_exploitable_valuable: true  # ignore theoretical/best-practice noise (bare MD5, headers, …)
   user_reachable_only: true        # only analyze sinks reachable from a user-facing entry point
 

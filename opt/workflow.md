@@ -96,12 +96,27 @@ substitute `python3` where that's the launcher. Nothing else is OS-specific.
 - **Stay in scope.** Touch only this folder and the Docker sandbox. Never modify
   the target's real remote. Never push the throwaway clone. Never exfiltrate
   anything — reporting is local only.
-- **Budgets** (`config.yaml → analysis`): at most `max_analyzer_agents` analysis
-  subagents. **`max_verify_per_cycle` no longer caps verification — verify EVERY
-  recorded finding on a live environment (see §7).** The budget only orders the
-  work (highest severity / most reachable first); keep verifying until every
-  finding has a terminal verdict (`verified` / `triaged` / `dismissed` / an
-  explicit unverified-with-blocker), across multiple passes if needed.
+- **Budgets** (`config.yaml → analysis`): cap parallel fan-out per phase at
+  `max_recon_agents` (recon), `max_authz_agents` (authz area + auth-mechanism),
+  and `max_analyzer_agents` (dataflow). **`max_verify_per_cycle` no longer caps
+  verification — verify EVERY recorded finding on a live environment (see §7).**
+  The budgets order the work (highest severity / most reachable first); keep
+  verifying until every finding has a terminal verdict (`verified` / `triaged` /
+  `dismissed` / an explicit unverified-with-blocker), across multiple passes if
+  needed.
+- **Hard deadline & large-repo strategy.** When run headlessly by the
+  orchestrator, the whole cycle has a hard wall-clock budget (`orchestrate.py
+  --timeout`, default 1h) after which the session is killed and anything not
+  written to the store is lost. So: **(1) checkpoint findings the moment they
+  clear the bar** — `add-finding` immediately, `set-status` right after
+  verifying; never batch to the end. **(2) On a large codebase, don't attempt
+  exhaustive coverage in one cycle** — respect the fan-out caps above, analyze the
+  highest-value areas first, record partial coverage (note what's unmapped in
+  `coverage.unmapped`), and let the next incremental cycle continue from the
+  persisted `knowledge/` model. **(3) Land the plane** — reserve the last few
+  minutes to run `org.py record` + `verify.py nuke`; if time is short, stop
+  hunting, record what you have, then record + nuke. A clean partial cycle beats a
+  killed one.
 - **Verify all findings dynamically.** Do not leave any recorded finding (MEDIUM
   included) as a static-only candidate when the target can be built: stand it up in
   the Docker sandbox and prove (or refute) each one at runtime with `[SECFORGE]`
@@ -174,7 +189,8 @@ and a machine-readable `knowledge_dir/model.json`, so future runs don't re-deriv
 this. Follow the **recon-cartographer** brief.
 
 - **BASELINE:** run the cartographer over the whole repo (scope `full`; for a
-  large repo, split by subtree across parallel cartographers and merge). It
+  large repo, split by subtree across parallel cartographers — up to
+  `max_recon_agents` — and merge). It
   covers: **(1) the idea/purpose**, **(2) every entry point** (attack surface),
   **(3) roles/users**, **(4) authn + authz**.
 - **INCREMENTAL:** only refresh the parts the diff touches. If `changed_files`
@@ -249,7 +265,9 @@ templates, error handling, or logging; otherwise reuse it.
 ## 5. Phase C — Access-control analysis (step 6)
 This is the class the grep guardrail can only hint at. Follow the
 **authz-analyzer** brief and `docs/AUTHZ_METHODOLOGY.md`. Spawn authz subagents
-up to the budget, each given: the model (`ENTRYPOINTS.md` / `ROLES.md` /
+up to `max_authz_agents` (area agents + the one mandatory auth-mechanism agent;
+on a large repo prefer fewer, higher-value routers this cycle over covering every
+subtree at once), each given: the model (`ENTRYPOINTS.md` / `ROLES.md` /
 `AUTH.md` / `model.json`), `DISCLOSURE_INDEX.md` from §4.5, the authz-marker
 hotspots, and (incremental) the changed files. Two kinds of agent:
 
@@ -369,7 +387,11 @@ first, and dynamically verify each. Reuse ONE shared sandbox across findings for
 the same target when practical (build/boot once, then verify each finding against
 it) so "verify all" stays affordable. Mark each `verifying`, then spawn a
 **finding-verifier** subagent. It boots the target in the sandbox
-(`scripts/verify.py …`), **inserts `[SECFORGE]` debug log lines along the
+(`scripts/verify.py …`). **Pre-pull any large public base image first** —
+`python scripts/verify.py pull --image <ref>` (e.g. `kartoza/geoserver:2.26.0`) —
+so the multi-minute fetch runs on its own long timeout instead of eating into
+container-start (and the deadline); the image is cached for the rest of the run
+(`nuke` never removes images). Then it **inserts `[SECFORGE]` debug log lines along the
 source→sink path in the throwaway clone** (or enables the app's own query/SQL
 logging as the equivalent evidence), rebuilds, fires the exploit (injection marker
 / `{{7*191}}` / loopback SSRF sentinel / two-principal IDOR), and reads

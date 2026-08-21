@@ -254,9 +254,16 @@ def sync(owner: str, is_user: bool = False, include_forks: bool = False,
             "skipped_small": sk_size, "pending": orgdb.pending_count()}
 
 
-def record(repo_url: str | None, slug: str | None) -> dict:
-    """After a session: mirror this repo's findings.json into the DB and mark it
-    analyzed at the current commit."""
+def record(repo_url: str | None, slug: str | None, partial: bool = False) -> dict:
+    """After a session: mirror this repo's findings.json into the DB.
+
+    Full mode (default): also mark the repo `analyzed` at the current commit — the
+    step a completed cycle runs at the end.
+    `partial=True`: fold the findings + severity counts into the DB but DO NOT mark
+    analyzed. This is the salvage path the orchestrator runs when a session was
+    killed before it could record (timeout/crash): the findings it did write to
+    knowledge/<slug>/findings.json are preserved and queryable, while the repo
+    stays retryable (its reaped `error` status is left untouched)."""
     import store  # noqa: E402  (keyed to this repo via env)
     if not slug:
         slug = target_slug(repo_url or os.environ.get("SECFORGE_TARGET_REPO", ""))
@@ -268,8 +275,9 @@ def record(repo_url: str | None, slug: str | None) -> dict:
         orgdb.sync_finding(slug, commit or f.get("last_commit"), f)
     counts = {s: sum(1 for f in findings if (f.get("severity") or "").upper() == s)
               for s in ("MEDIUM", "HIGH", "CRITICAL")}
-    orgdb.set_status(slug, "analyzed", analyzed_commit=commit)
-    return {"slug": slug, "analyzed_commit": commit,
+    if not partial:
+        orgdb.set_status(slug, "analyzed", analyzed_commit=commit)
+    return {"slug": slug, "partial": partial, "analyzed_commit": commit,
             "findings_synced": len(findings), **{k.lower(): v for k, v in counts.items()}}
 
 
@@ -294,6 +302,10 @@ def main() -> None:
     p = sub.add_parser("next-batch"); p.add_argument("--count", type=int, default=10)
     p = sub.add_parser("record")
     p.add_argument("--repo"); p.add_argument("--slug")
+    p.add_argument("--partial", action="store_true",
+                   help="salvage: fold findings into the DB WITHOUT marking the "
+                        "repo analyzed (used after an aborted/timed-out session so "
+                        "its partial findings survive and it stays retryable)")
 
     args = ap.parse_args()
     if args.cmd == "sync":
@@ -312,7 +324,7 @@ def main() -> None:
     elif args.cmd == "record":
         if not (args.repo or args.slug):
             raise SystemExit("record needs --repo <url> or --slug <slug>")
-        _print(record(args.repo, args.slug))
+        _print(record(args.repo, args.slug, partial=args.partial))
 
 
 if __name__ == "__main__":

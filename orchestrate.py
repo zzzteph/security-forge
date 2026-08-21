@@ -103,7 +103,9 @@ def next_targets(count: int, rescan: bool = False) -> list:
     return [t for t in r if t.get("slug")] if isinstance(r, list) else []
 
 
-def build_prompt(repo_url: str, slug: str) -> str:
+def build_prompt(repo_url: str, slug: str, timeout: int) -> str:
+    mins = max(1, timeout // 60)
+    reserve = 3 if mins <= 45 else 5   # minutes to keep back for record + nuke
     return (
         f"You are analyzing EXACTLY ONE repository: {repo_url} (slug {slug}). "
         f"SECFORGE_TARGET_REPO is already set to it in your environment, so every "
@@ -117,16 +119,30 @@ def build_prompt(repo_url: str, slug: str) -> str:
         f"nuke`. Do NOT analyze any other repo, do NOT loop to a next repo, never "
         f"ask questions, keep everything local (notify-only). Stop as soon as this "
         f"one repo is recorded. "
-        f"CRITICAL — this is ONE headless turn with NO step or time budget: run the "
-        f"ENTIRE pipeline synchronously in THIS turn and take as long as you need. "
-        f"NEVER call ScheduleWakeup and NEVER defer work to a background agent and "
-        f"end your turn waiting for it to report back — if you delegate to a "
-        f"subagent, wait for it to finish and return WITHIN this turn, then continue. "
-        f"Do not pause, yield, or schedule a continuation. Your turn MUST NOT end "
-        f"until BOTH `python scripts/org.py record --repo {repo_url}` AND `python "
-        f"scripts/verify.py nuke` have actually run for this repo; if you feel "
-        f"tempted to stop before then, keep working through recon -> bug-hunting -> "
-        f"sandbox verification -> record -> nuke instead."
+        f"CRITICAL — HARD DEADLINE: this session is force-killed at ~{mins} minutes "
+        f"of wall-clock; whatever is not written to the store by then is LOST. Plan "
+        f"the whole cycle around that budget: "
+        f"(1) RUN SYNCHRONOUSLY in THIS turn — never call ScheduleWakeup, never "
+        f"defer work to a background agent and end your turn waiting for it to "
+        f"report back; if you delegate to a subagent, wait for it to finish and "
+        f"return WITHIN this turn, then continue. Do not pause, yield, or schedule "
+        f"a continuation. "
+        f"(2) CHECKPOINT AS YOU GO — `add-finding` each bug the MOMENT it clears the "
+        f"bar, and `set-status` right after you verify it; never batch findings to "
+        f"the end. A confirmed finding still sitting in your head when the deadline "
+        f"hits is a finding lost, so persist early and often. "
+        f"(3) BREADTH BEFORE DEPTH on a large repo — cap subagent fan-out to the "
+        f"config budget (analysis.max_recon_agents / max_authz_agents / "
+        f"max_analyzer_agents) and cover the highest-value areas first. It is FINE "
+        f"to finish a cycle with only partial coverage recorded: the next "
+        f"(incremental) run resumes from the persisted knowledge/ model, so do NOT "
+        f"try to exhaustively analyze AND verify a huge codebase in a single cycle. "
+        f"(4) LAND THE PLANE — keep the last ~{reserve} minutes to run BOTH `python "
+        f"scripts/org.py record --repo {repo_url}` AND `python scripts/verify.py "
+        f"nuke`. If time is running short, STOP hunting, record what you already "
+        f"have, then record + nuke. Ending the turn cleanly with findings recorded "
+        f"always beats being killed mid-analysis with the work unsaved. Your turn "
+        f"MUST NOT end until BOTH record AND nuke have actually run for this repo."
     )
 
 
@@ -324,22 +340,47 @@ def process_repo(t: dict, args, logs: Path, idx: int, total) -> str:
     print(f"[orch] ({idx}/{total}) {slug} → session (≤{args.timeout}s)  log: {log}",
           flush=True)
     t0 = time.monotonic()
-    rc = run_session(build_prompt(repo_url, slug), env_extra, args.claude,
-                     args.model, args.timeout, log, args.heartbeat, args.silent)
+    rc = run_session(build_prompt(repo_url, slug, args.timeout), env_extra,
+                     args.claude, args.model, args.timeout, log, args.heartbeat,
+                     args.silent)
     cleanup(slug, env_extra)
     orgdb("reap-stale", "--max-attempts", str(args.max_attempts))
     row = orgdb("show", "--slug", slug) or {}
     st = row.get("status")
+    salvaged = salvage_partial(repo_url, st)
     dt = int(time.monotonic() - t0)
     if st == "analyzed":
         print(f"[orch]   ✓ analyzed {(row.get('analyzed_commit') or '')[:8]} "
               f"(rc={rc}, {dt}s, MED={row.get('medium_count',0)} "
               f"HIGH={row.get('high_count',0)} CRIT={row.get('critical_count',0)})")
     elif st == "skipped":
-        print(f"[orch]   ⤼ skipped after repeated aborts (rc={rc}, {dt}s)")
+        print(f"[orch]   ⤼ skipped after repeated aborts (rc={rc}, {dt}s)"
+              f"{_salvage_str(salvaged)}")
     else:
-        print(f"[orch]   ✗ not completed (status={st}, rc={rc}, {dt}s) — retry next run")
+        print(f"[orch]   ✗ not completed (status={st}, rc={rc}, {dt}s)"
+              f"{_salvage_str(salvaged)} — retry next run")
     return st
+
+
+def salvage_partial(repo_url: str, status: str | None) -> dict | None:
+    """When a session is killed before it can run `org.py record` (a timeout, a
+    crash, a platform safeguard), its findings still live in knowledge/<slug>/
+    findings.json — cleanup() keeps knowledge/. Fold whatever it DID find into the
+    DB so a partial run is never a total loss. `record --partial` syncs the
+    findings + severity counts WITHOUT marking the repo analyzed, so it stays
+    retryable next run. No-op for a repo that finished cleanly (already recorded)."""
+    if status == "analyzed":
+        return None
+    sv = org("record", "--repo", repo_url, "--partial")
+    return sv if isinstance(sv, dict) and sv.get("findings_synced") else None
+
+
+def _salvage_str(sv: dict | None) -> str:
+    if not sv:
+        return ""
+    return (f" — salvaged {sv.get('findings_synced', 0)} finding(s) "
+            f"(MED={sv.get('medium', 0)} HIGH={sv.get('high', 0)} "
+            f"CRIT={sv.get('critical', 0)})")
 
 
 def cleanup(slug: str, env_extra: dict):
@@ -376,8 +417,13 @@ def main():
     g.add_argument("--repo", help="analyze a SINGLE repo URL (one session), then stop")
     ap.add_argument("--include-forks", action="store_true")
     ap.add_argument("--include-archived", action="store_true")
-    ap.add_argument("--timeout", type=int, default=1800,
-                    help="hard per-repo session timeout, seconds (default: 1800)")
+    ap.add_argument("--timeout", type=int, default=3600,
+                    help="hard per-repo session timeout, seconds (default: 3600 = "
+                         "1h). Verification-heavy targets (large Docker base images, "
+                         "big repos) may need more — raise it, e.g. --timeout 7200 "
+                         "for 2h. The per-repo session is told its budget and plans "
+                         "around it (breadth-first, checkpoint findings, land record "
+                         "+ nuke before the deadline).")
     ap.add_argument("--max-repos", type=int, default=0,
                     help="stop after N repos this run (0 = until the queue is empty)")
     ap.add_argument("--max-attempts", type=int, default=2,

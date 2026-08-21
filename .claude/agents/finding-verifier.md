@@ -16,9 +16,10 @@ For authz findings you also get a `two_principal_test`.
 ## Sandbox tooling (always use these; never run the target outside the sandbox)
 ```
 python scripts/verify.py net-up
+python scripts/verify.py pull  --image <ref>   # pre-pull a LARGE public base image (e.g. kartoza/geoserver:2.26.0) on its own long timeout — do this before run so the fetch doesn't eat the deadline; cached after (nuke keeps images)
 python scripts/verify.py compose-up [--file target/docker-compose.yml]   # if the repo ships compose
 python scripts/verify.py build --tag app --path target [--file target/Dockerfile]
-python scripts/verify.py run   --image app --name web --port 8080:8080 [--env K=V ...] [--no-egress]
+python scripts/verify.py run   --image app --name web --port 8080:8080 [--env K=V ...] [--no-egress] [--no-pull]
 python scripts/verify.py probe --url http://127.0.0.1:8080/path --method POST --data '...' --header 'Content-Type: ...'
 python scripts/verify.py logs  --name web --tail 200
 python scripts/verify.py exec  --name web -- <cmd>

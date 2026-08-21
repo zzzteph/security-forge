@@ -6,16 +6,25 @@ Give Claude Code a repo. It maps the project, looks for vulnerabilities, and run
 the app to check that the ones it flags are actually exploitable. Results are
 written to disk. It never touches the target's PRs or CI.
 
-## Quickstart
+## How to run
 
-Open Claude Code in this folder and run:
+Open Claude Code in this folder and scan one repo:
 
 ```
 /security-forge https://github.com/OWNER/REPO
 ```
 
-It clones the repo, runs the analysis, and writes findings to disk. Setup and the
-rest of the options are in [docs/WORKFLOW.md](docs/WORKFLOW.md).
+Or from the terminal:
+
+```bash
+python orchestrate.py --repo https://github.com/OWNER/REPO   # one repo
+python orchestrate.py --org OWNER                            # every repo in an org
+python orchestrate.py --org OWNER --rescan                   # re-scan only what changed
+```
+
+First run needs a one-time [setup](docs/WORKFLOW.md). For org scans, put a
+`GITHUB_TOKEN` in `.env`. Results land under `knowledge/<repo>/`, and org runs also
+record into `db/security-forge.db`.
 
 ## Where the results end up
 
@@ -61,15 +70,9 @@ target lands on disk.
 
 ## Scan a whole org
 
-There's an orchestrator that runs the workflow across every repo in a GitHub org
-and stores the results in a committed SQLite DB (`db/security-forge.db`), so one
-copy of security-forge becomes the durable memory of your whole org. It launches
-one isolated, timeout-bounded Claude session per repo and is fully resumable.
-
-```bash
-python orchestrate.py --org my-org            # analyze every repo not done yet
-python orchestrate.py --org my-org --rescan   # re-sync and re-analyze only the diffs
-```
-
-Put a `GITHUB_TOKEN` in `.env` for private repos. Details, flags, and how to query
-the DB are in [docs/ORCHESTRATION.md](docs/ORCHESTRATION.md).
+`orchestrate.py --org` runs the workflow across every repo in a GitHub org, one
+isolated and timeout-bounded session at a time, and stores everything in a
+committed SQLite DB (`db/security-forge.db`) so one copy of security-forge becomes
+the durable memory of your whole org. It's fully resumable, and `--rescan`
+re-analyzes only the repos that changed. Full flags and DB queries are in
+[docs/ORCHESTRATION.md](docs/ORCHESTRATION.md).
