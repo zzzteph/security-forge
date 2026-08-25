@@ -70,6 +70,16 @@ Save any PoC script or the captured request/response to `reports/<finding-id>.*`
 via Write so the orchestrator can attach it. Note which debug lines you added
 (file:line) so the result is reproducible.
 
+**For a HIGH/CRITICAL, your instrumented run is NOT the final word.** The
+`[SECFORGE]` evidence is how you locate and confirm the flow, but the finding only
+counts as `verified` (and advisory-worthy) once a **clean, self-contained PoC
+bundle** — `docker-compose.yml` + `poc.py`, no instrumentation — reproduces it
+end to end. Build that bundle in `<knowledge_dir>/poc/<NN>-<slug>/`, then have the
+orchestrator gate it with `pipeline.py verify-poc <id> --dir <bundle>` (exit 0 +
+`EXPLOITED ✓`). If your hand-driven exploit fired but a clean bundle can't
+reproduce it, it is NOT verified — return `could_not_run`/`not_reachable`, not
+`verified`. Return the bundle path so the orchestrator can run the gate.
+
 ## Output (final message = return value), JSON only:
 ```json
 {
@@ -82,6 +92,8 @@ via Write so the orchestrator can attach it. Note which debug lines you added
       "request": "the exact request/payload sent",
       "instrumentation": "debug lines added (file:line) and what they printed",
       "evidence": "response + [SECFORGE] log excerpt proving (or refuting) the sink fired with tainted input",
+      "poc_bundle_dir": "HIGH/CRITICAL: path to the clean runnable bundle to gate with verify-poc (else null)",
+      "poc_bundle_passed": "HIGH/CRITICAL: true only if `verify-poc` on that bundle exited 0 (EXPLOITED ✓); else false/null",
       "severity_adjust": "optional: revised severity + why",
       "notes": "boot issues, assumptions, creds/seed used"
     }

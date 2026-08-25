@@ -77,7 +77,9 @@ def add_one(finding: dict, commit: str | None = None) -> dict:
 
 def set_status(fid: str, status: str, note: str | None = None,
                evidence: str | None = None, reported: bool | None = None,
-               fix_reported: bool | None = None) -> dict:
+               fix_reported: bool | None = None, poc_verified: bool | None = None,
+               poc_evidence: str | None = None, poc_dir: str | None = None,
+               advisory_path: str | None = None) -> dict:
     db = _load()
     if fid not in db:
         raise SystemExit(f"unknown finding id: {fid}")
@@ -94,6 +96,19 @@ def set_status(fid: str, status: str, note: str | None = None,
         rec["fix_reported"] = fix_reported
         if fix_reported:
             rec["fix_reported_at"] = now_iso()
+    if poc_verified is not None:
+        # The HARD gate for an advisory: True only when the runnable PoC BUNDLE
+        # itself reproduced (exit 0 / EXPLOITED) this cycle — set exclusively by
+        # `pipeline.py verify-poc`, never by hand. A later failed re-check flips it
+        # back to False, which strips the advisory in `gc-advisories`.
+        rec["poc_verified"] = bool(poc_verified)
+        rec["poc_verified_at"] = now_iso() if poc_verified else None
+    if poc_evidence:
+        rec["poc_evidence"] = poc_evidence
+    if poc_dir:
+        rec["poc_dir"] = poc_dir
+    if advisory_path:
+        rec["advisory_path"] = advisory_path
     if evidence:
         rec["evidence"] = evidence
     if note:

@@ -407,15 +407,38 @@ exploit `poc.py`) must be written into that finding's durable PoC folder
 (`<knowledge_dir>/poc/<slug>/`, see §8.6) — never left in scratch/temp — so the
 person can re-run it by hand later. Apply each verdict:
 ```bash
-# reachable & exploitable:
-python scripts/pipeline.py set-status <id> verified --evidence "<request+response/log excerpt>"
 # present in source but not reachable in the running app:
 python scripts/pipeline.py set-status <id> triaged  --note "not reachable in default deploy: <why>"
 # false positive:
 python scripts/pipeline.py set-status <id> dismissed --note "<why>"
+# MEDIUM, reachable & confirmed at runtime (no PoC bundle by design — instrumented
+# runtime evidence is the standard for MEDIUM):
+python scripts/pipeline.py set-status <id> verified --evidence "<request+response/[SECFORGE] log excerpt>"
 ```
-If the target can't be built/run, keep findings as **unverified candidates** (still
-reportable per policy, clearly marked unconfirmed).
+
+**HIGH/CRITICAL: `verified` is EARNED by the runnable bundle, not asserted.** The
+instrumented `[SECFORGE]` run above is how you *find* the flow; it is NOT what
+marks a HIGH/CRITICAL `verified`. For every HIGH/CRITICAL candidate, build the
+self-contained PoC bundle now (§8.6) and run it end to end exactly as a human
+would — then let that result set the status:
+```bash
+# builds nothing, mark the bundle location first so verify-poc can find it:
+python scripts/pipeline.py set-status <id> --poc-dir "<knowledge_dir>/poc/<NN>-<slug>"
+# THE GATE — boots the bundle (`docker compose up -d --build`), runs poc.py, and
+# marks the finding `verified` (+ poc_verified) ONLY if it exits 0 AND prints
+# `EXPLOITED ✓`. Any other outcome leaves it NOT verified and exits non-zero:
+python scripts/pipeline.py verify-poc <id> --dir "<knowledge_dir>/poc/<NN>-<slug>"
+```
+Do **not** hand-set `verified` on a HIGH/CRITICAL — only `verify-poc` may, by
+actually reproducing it. If `verify-poc` does not pass, the bundle is wrong or the
+finding is a false positive: fix the bundle and re-run, or downgrade
+(`triaged`/`dismissed`). A HIGH/CRITICAL that never reproduces via `verify-poc`
+gets **no advisory** (§8.5) — this is exactly the "PoC that never succeeds but the
+advisory exists anyway" failure, closed at the source.
+
+If the target can't be built/run at all, keep findings as **unverified candidates**
+(still reportable per policy, clearly marked unconfirmed) — but an unverified
+finding is **never** `poc_verified`, so it gets no advisory.
 
 **A failed verification is a signal, not a formality.** If the exploit does not
 fire and you cannot show a concrete runtime precondition that explains why, the
@@ -470,9 +493,18 @@ then `set-status <id> --fix-reported`.
 If `report.attach_report_file`, also `notify --file reports/<id>.md` (records the path).
 
 ## 8.5. Phase F2 — Draft a GitHub Security Advisory (HIGH & CRITICAL only)
-**Advisories are for HIGH and CRITICAL findings only.** Write one for every
-HIGH/CRITICAL that reached `verified` (and any still-open HIGH/CRITICAL
-`triaged`/unverified you want a maintainer to see). **Never draft an advisory for a
+**Advisories are for HIGH and CRITICAL findings only — AND ONLY when the runnable
+PoC bundle actually reproduced.** The hard gate: write an advisory for a finding
+**iff `poc_verified` is true** — i.e. its bundle passed `pipeline.py verify-poc`
+(exit 0 + `EXPLOITED ✓`) this cycle (§7). Confirm before writing:
+```bash
+python scripts/pipeline.py get --min-sev HIGH --brief   # only entries with "poc_verified": true get an advisory
+```
+**Never** write an advisory from a self-asserted `verified` status, from static
+reasoning, or for a `triaged`/unverified/`could_not_run` finding — those get no
+advisory, no exceptions. (A HIGH/CRITICAL you believe is real but could not
+reproduce goes to the executive summary's limits section, not to an advisory.)
+**Never draft an advisory for a
 MEDIUM**, even a verified one — a coordinated-disclosure document for a flaw that
 needs an already-known id devalues the ones that matter. MEDIUMs are reported in the
 notification channel (§8) and summarised in the executive summary (§8.7); that is
@@ -485,6 +517,11 @@ folder**:
 (Number them `01`, `02`, … per target; slug from the finding, e.g.
 `GHSA-02-workflowmanualtasks-get-idor.md`.) Create the folder if absent; write one
 file per finding (idempotent — overwrite the same slug on re-runs, don't duplicate).
+**Immediately link the file to its finding** so the janitor can tell a backed
+advisory from an orphan:
+```bash
+python scripts/pipeline.py set-status <id> --advisory-path "<knowledge_dir>/advisories/GHSA-<NN>-<slug>.md"
+```
 Each file MUST contain, in this order:
 1. **Header metadata** — project, ecosystem/package, **affected versions** (state
    what was confirmed vs. what needs range-checking), the exact **verified commit /
@@ -502,11 +539,16 @@ Keep advisories factual and coordinated-disclosure-ready; **do not** file/publis
 them anywhere (no PRs, no public posts) — they are drafts for the person to submit.
 `triaged`/unreachable findings must say so in the header rather than read as live.
 
-## 8.6. Phase F3 — Reproducible PoC bundle (verified HIGH & CRITICAL)
-Every **verified HIGH/CRITICAL** finding gets a **self-contained, runnable PoC
-folder** so a person can reproduce it by hand — not just read about it. (A verified
-MEDIUM does not get a bundle; its request/response evidence stays on the finding
-record and is cited in the executive summary.)
+## 8.6. Phase F3 — Reproducible PoC bundle (the HIGH/CRITICAL verification gate)
+Every HIGH/CRITICAL gets a **self-contained, runnable PoC folder** — and this
+bundle is not a write-up produced *after* verification, it **is** the verification
+(§7): the finding only becomes `verified` when `pipeline.py verify-poc` boots this
+exact bundle and it reproduces (exit 0 + `EXPLOITED ✓`). So build it before you
+call the finding verified, and make it pass — the artifact a human runs and the
+artifact that gated the advisory are then one and the same, which is what stops a
+"green advisory, red PoC" divergence. (A verified MEDIUM does not get a bundle; its
+request/response evidence stays on the finding record and is cited in the
+executive summary.)
 ```
 <knowledge_dir>/poc/<NN>-<short-slug>/
 ├── docker-compose.yml     # boots the vulnerable target with ONE command
@@ -529,6 +571,12 @@ Requirements:
 - **Reuse, don't reinvent.** These are exactly the assets the finding-verifier
   produced in §7 — copy them here verbatim (compose, seed, `poc.py`) rather than
   authoring new ones; only add the `README.md` manual.
+- **It must actually pass the gate.** After writing the bundle, run `python
+  scripts/pipeline.py verify-poc <id> --dir <this folder>` and confirm it exits 0
+  and flips the finding to `verified`/`poc_verified`. If it doesn't reproduce, the
+  bundle (or the finding) is wrong — fix it and re-run, or downgrade the finding.
+  `poc.py`'s success line must be exactly `EXPLOITED ✓` and it must exit non-zero
+  on failure, because that string + exit code ARE the gate.
 - **README.md** must contain: the finding title + severity + affected version/commit;
   **Prerequisites** (Docker); **Run** (the two commands + expected wait/URL/creds);
   **Expected output** (what a successful exploit prints, with a sample); **Manual
@@ -614,14 +662,24 @@ own choice locally. Just make sure the model + findings JSON are written under
 
 ## 10. Phase H — Cycle summary + cleanup (always)
 ```bash
+# Janitor — enforce "advisory ⇔ reproduced": delete any advisory/PoC bundle NOT
+# backed by a poc_verified finding (dry-run first, then apply). Run this EVERY
+# cycle, so an advisory left over from a finding that later failed re-verification
+# is swept:
+SECFORGE_TARGET_REPO="<url>" python scripts/pipeline.py gc-advisories            # preview
+SECFORGE_TARGET_REPO="<url>" python scripts/pipeline.py gc-advisories --apply     # remove orphans
 SECFORGE_TARGET_REPO="<url>" python scripts/pipeline.py notify "✅ security-forge cycle: {repo}@{short_commit} — {n_new} new, {n_verified} verified, {n_candidates} candidates, {n_fixed} mitigated, {n_advisories} advisories, {n_sent} sent."   # if report.cycle_summary
 SECFORGE_TARGET_REPO="<url>" python scripts/pipeline.py nuke   # tear down Docker sandbox — ALWAYS
 ```
 Confirm before stopping:
 - **every** finding reached a terminal verdict (§7);
+- every **advisory on disk maps to a `poc_verified` finding** — i.e. `gc-advisories`
+  reported nothing left to remove. No advisory may exist without a bundle that
+  reproduced via `verify-poc`;
 - every **verified HIGH/CRITICAL** has BOTH an advisory file in
   `<knowledge_dir>/advisories/` (§8.5) AND a runnable PoC bundle in
-  `<knowledge_dir>/poc/<slug>/` (§8.6) — MEDIUMs get neither, by design;
+  `<knowledge_dir>/poc/<slug>/` (§8.6) that passed `verify-poc` — MEDIUMs get
+  neither, by design;
 - every recorded **MEDIUM** appears in the executive summary's medium section with
   its precondition and promotion condition (§8.7);
 - `<knowledge_dir>/EXECUTIVE_SUMMARY.md` was rewritten this cycle (§8.7) and its

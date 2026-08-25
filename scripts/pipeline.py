@@ -12,7 +12,10 @@ parts and gives the agent a clean interface to state:
     get          list findings as JSON (filter by --status/--min-sev/--unreported)
     show         print one finding by id
     add-finding  record an agent-discovered finding (from --json or stdin)
-    set-status   move a finding through its lifecycle / mark reported
+    set-status   move a finding through its lifecycle / mark reported / link advisory+PoC
+    verify-poc   run a finished PoC bundle end-to-end; mark `verified` ONLY if it
+                 actually reproduces (exit 0 + success marker) — the advisory gate
+    gc-advisories delete advisories + PoC bundles NOT backed by a reproduced finding
     notify       emit a notification locally (stdout + per-target log)
     nuke         tear down the docker verification sandbox
 """
@@ -90,6 +93,7 @@ def cmd_get(args) -> None:
     if args.brief:
         items = [{"id": f["id"], "severity": f["severity"], "status": f["status"],
                   "reported": f.get("reported"), "fix_reported": f.get("fix_reported"),
+                  "poc_verified": bool(f.get("poc_verified")),
                   "title": f["title"], "file": f.get("file"), "line": f.get("line")}
                  for f in items]
     _print(items)
@@ -128,9 +132,94 @@ def cmd_add_finding(args) -> None:
 def cmd_set_status(args) -> None:
     rec = store.set_status(args.id, args.status, note=args.note,
                            evidence=args.evidence, reported=args.reported,
-                           fix_reported=args.fix_reported)
+                           fix_reported=args.fix_reported,
+                           advisory_path=args.advisory_path, poc_dir=args.poc_dir)
     _print({"id": rec["id"], "status": rec.get("status"),
-            "reported": rec.get("reported"), "fix_reported": rec.get("fix_reported")})
+            "reported": rec.get("reported"), "fix_reported": rec.get("fix_reported"),
+            "poc_verified": bool(rec.get("poc_verified")),
+            "advisory_path": rec.get("advisory_path"), "poc_dir": rec.get("poc_dir")})
+
+
+def cmd_verify_poc(args) -> None:
+    """THE advisory gate: run a finished PoC bundle end-to-end and mark the finding
+    `verified` ONLY if it actually reproduces (exit 0 + success marker). A failure
+    clears `poc_verified` so `gc-advisories` will strip any advisory written on it.
+    Exits non-zero when the bundle does not reproduce, so callers/CI can see it."""
+    ensure_dirs()
+    rec = store.get(args.id)
+    if not rec:
+        raise SystemExit(f"unknown finding id: {args.id}")
+    poc_dir = args.dir or rec.get("poc_dir")
+    if not poc_dir:
+        raise SystemExit("no PoC bundle dir: pass --dir <bundle> (or record it on the "
+                         "finding first with set-status --poc-dir)")
+    import verify  # noqa: E402
+    res = verify.verify_poc(poc_dir, project=args.project, script=args.script,
+                            success_marker=args.success_marker, fail_marker=args.fail_marker,
+                            up_timeout=args.up_timeout, run_timeout=args.run_timeout,
+                            keep=args.keep)
+    passed = bool(res.get("passed"))
+    tail = (res.get("stdout_tail") or res.get("log_tail") or res.get("error") or "")
+    ev = (f"PoC bundle {poc_dir}: passed={passed} exit={res.get('exit_code')} "
+          f"phase={res.get('phase')} (marker '{res.get('success_marker', args.success_marker)}')\n"
+          f"{tail[-1800:]}")
+    if passed:
+        store.set_status(args.id, "verified", evidence=ev, poc_verified=True,
+                         poc_evidence=ev, poc_dir=str(poc_dir))
+    else:
+        # Do NOT flip to verified. Clear poc_verified and log the failure so the
+        # advisory GC removes any advisory that was drafted on a false positive.
+        store.set_status(args.id, "", poc_verified=False, poc_evidence=ev,
+                         note=(f"PoC bundle did NOT reproduce (exit={res.get('exit_code')}, "
+                               f"phase={res.get('phase')}) — not verified, advisory not warranted"))
+    _print({"id": args.id, "passed": passed, **res})
+    if not passed:
+        raise SystemExit(3)
+
+
+def cmd_gc_advisories(args) -> None:
+    """Enforce 'advisory ⇔ reproduced': delete every advisory file and PoC bundle
+    that is NOT backed by a `poc_verified` finding (i.e. one whose runnable bundle
+    actually reproduced via verify-poc). Dry-run by default; --apply removes.
+
+    Keep-set = the advisory_path / poc_dir recorded on poc_verified findings, so
+    an advisory survives ONLY when its finding both reproduced AND linked the file.
+    Anything else — advisories on dismissed/failed findings, orphans with no finding
+    — is swept."""
+    from common import KNOWLEDGE_DIR  # noqa: E402
+    import shutil
+    findings = store.query()
+    keep_adv, keep_poc = set(), set()
+    for f in findings:
+        if not f.get("poc_verified"):
+            continue
+        if f.get("advisory_path"):
+            keep_adv.add(str(Path(f["advisory_path"]).expanduser().resolve()))
+        if f.get("poc_dir"):
+            keep_poc.add(str(Path(f["poc_dir"]).expanduser().resolve()))
+    removed_adv, kept_adv, removed_poc, kept_poc = [], [], [], []
+    adv_dir = KNOWLEDGE_DIR / "advisories"
+    if adv_dir.is_dir():
+        for p in sorted(adv_dir.glob("*.md")):
+            if p.name.lower() == "readme.md":
+                continue
+            (kept_adv if str(p.resolve()) in keep_adv else removed_adv).append(str(p))
+    poc_root = KNOWLEDGE_DIR / "poc"
+    if poc_root.is_dir():
+        for d in sorted(x for x in poc_root.iterdir() if x.is_dir()):
+            (kept_poc if str(d.resolve()) in keep_poc else removed_poc).append(str(d))
+    if args.apply:
+        for p in removed_adv:
+            try:
+                Path(p).unlink()
+            except OSError as e:
+                eprint(f"[gc] could not remove {p}: {e}")
+        for d in removed_poc:
+            shutil.rmtree(d, ignore_errors=True)
+    _print({"applied": bool(args.apply),
+            "poc_verified_findings": sum(1 for f in findings if f.get("poc_verified")),
+            "advisories_removed": removed_adv, "advisories_kept": kept_adv,
+            "poc_removed": removed_poc, "poc_kept": kept_poc})
 
 
 def cmd_paths(args) -> None:
@@ -210,7 +299,27 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--note"); p.add_argument("--evidence")
     p.add_argument("--reported", dest="reported", action="store_true", default=None)
     p.add_argument("--fix-reported", dest="fix_reported", action="store_true", default=None)
+    p.add_argument("--advisory-path", help="link the advisory file written for this finding "
+                   "(required for it to survive gc-advisories)")
+    p.add_argument("--poc-dir", help="link this finding's runnable PoC bundle folder")
     p.set_defaults(fn=cmd_set_status)
+    # NOTE: poc_verified is deliberately NOT settable here — only `verify-poc` may
+    # set it, by actually running the bundle. That is what keeps it trustworthy.
+
+    p = sub.add_parser("verify-poc")
+    p.add_argument("id"); p.add_argument("--dir", help="the PoC bundle folder (else the "
+                   "finding's recorded poc_dir)"); p.add_argument("--project")
+    p.add_argument("--script", default="poc.py")
+    p.add_argument("--success-marker", default="EXPLOITED")
+    p.add_argument("--fail-marker", default="NOT VULNERABLE")
+    p.add_argument("--up-timeout", type=int, default=1800)
+    p.add_argument("--run-timeout", type=int, default=900)
+    p.add_argument("--keep", action="store_true", help="don't tear the bundle down after")
+    p.set_defaults(fn=cmd_verify_poc)
+
+    p = sub.add_parser("gc-advisories")
+    p.add_argument("--apply", action="store_true", help="actually delete (default: dry-run)")
+    p.set_defaults(fn=cmd_gc_advisories)
 
     sub.add_parser("paths").set_defaults(fn=cmd_paths)
 

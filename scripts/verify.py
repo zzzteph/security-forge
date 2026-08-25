@@ -20,6 +20,7 @@ CLI:
     python scripts/verify.py build  --tag app --path target [--file target/Dockerfile]
     python scripts/verify.py run    --image app --name web --port 8080:8080 [--env K=V ...] [--no-egress] [--no-pull]
     python scripts/verify.py compose-up   [--file target/docker-compose.yml]
+    python scripts/verify.py verify-poc   --dir <knowledge>/poc/<slug>/   # run a finished PoC BUNDLE end-to-end; exit 0 iff it reproduces (the advisory gate)
     python scripts/verify.py probe  --url http://127.0.0.1:8080/ [--method GET] [--data '...'] [--header 'K: V' ...]
     python scripts/verify.py logs   --name web [--tail 200]
     python scripts/verify.py exec   --name web -- id
@@ -31,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 import urllib.request
@@ -146,12 +148,59 @@ def compose_down(file: str | None = None) -> dict:
     return {"ok": rc == 0}
 
 
-def _find_compose() -> str | None:
+def _find_compose(root: Path | None = None) -> str | None:
+    base = root or TARGET_DIR
     for n in ("docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"):
-        p = TARGET_DIR / n
+        p = base / n
         if p.exists():
             return str(p)
     return None
+
+
+def _poc_down(project: str, compose: str, cwd: Path, keep: bool) -> None:
+    if keep:
+        return
+    run([CONTAINER_CLI, "compose", "-p", project, "-f", compose, "down", "-v",
+         "--remove-orphans"], cwd=cwd, timeout=600)
+
+
+def verify_poc(poc_dir: str, project: str | None = None, script: str = "poc.py",
+               success_marker: str = "EXPLOITED", fail_marker: str = "NOT VULNERABLE",
+               up_timeout: int = 1800, run_timeout: int = 900, keep: bool = False) -> dict:
+    """Run a finished PoC BUNDLE exactly as a human would and report whether it
+    ACTUALLY reproduces. This is the hard gate behind a `verified` HIGH/CRITICAL
+    and its advisory: `docker compose up -d --build` in the bundle dir, then
+    `python <script>`, then PASS iff the exploit exits 0 AND prints the success
+    marker AND does not print the failure marker. Tears the bundle down after
+    (unless keep). No store side effects — `pipeline.py verify-poc` owns those."""
+    d = Path(poc_dir).expanduser().resolve()
+    if not d.is_dir():
+        return {"passed": False, "phase": "setup", "error": f"poc dir not found: {d}"}
+    compose = _find_compose(d)
+    if not compose:
+        return {"passed": False, "phase": "setup", "error": f"no docker-compose in {d}"}
+    pocf = d / script
+    if not pocf.exists():
+        return {"passed": False, "phase": "setup", "error": f"{script} not found in {d}"}
+    # namespaced under PREFIX so `nuke` sweeps any straggler containers too
+    project = project or (PREFIX + "poc_" + re.sub(r"[^a-z0-9_]", "_", d.name.lower()))[:60]
+    up_rc, up_out, up_err = run(
+        [CONTAINER_CLI, "compose", "-p", project, "-f", compose, "up", "-d", "--build"],
+        cwd=d, timeout=up_timeout)
+    if up_rc != 0:
+        _poc_down(project, compose, d, keep)
+        return {"passed": False, "phase": "compose-up", "exit_code": up_rc,
+                "log_tail": (up_err or up_out)[-2000:], "project": project, "compose": compose}
+    rc, out, err = run([sys.executable, str(pocf)], cwd=d, timeout=run_timeout)
+    lo = (out or "").lower()
+    passed = (rc == 0
+              and success_marker.lower() in lo
+              and fail_marker.lower() not in lo)
+    _poc_down(project, compose, d, keep)
+    return {"passed": passed, "phase": "poc", "exit_code": rc,
+            "success_marker": success_marker, "fail_marker": fail_marker,
+            "stdout_tail": (out or "")[-3000:], "stderr_tail": (err or "")[-1000:],
+            "compose": compose, "project": project, "kept": keep}
 
 
 def probe(url: str, method: str = "GET", data: str | None = None,
@@ -232,6 +281,11 @@ def main() -> None:
     p.add_argument("--no-pull", action="store_true", help="skip the pre-pull (image is already local)")
     p = sub.add_parser("compose-up"); p.add_argument("--file")
     p = sub.add_parser("compose-down"); p.add_argument("--file")
+    p = sub.add_parser("verify-poc"); p.add_argument("--dir", required=True); p.add_argument("--project")
+    p.add_argument("--script", default="poc.py")
+    p.add_argument("--success-marker", default="EXPLOITED"); p.add_argument("--fail-marker", default="NOT VULNERABLE")
+    p.add_argument("--up-timeout", type=int, default=1800); p.add_argument("--run-timeout", type=int, default=900)
+    p.add_argument("--keep", action="store_true")
     p = sub.add_parser("probe"); p.add_argument("--url", required=True); p.add_argument("--method", default="GET")
     p.add_argument("--data"); p.add_argument("--header", action="append", default=[])
     p = sub.add_parser("logs"); p.add_argument("--name", required=True); p.add_argument("--tail", type=int, default=200)
@@ -253,6 +307,11 @@ def main() -> None:
         _out(compose_up(a.file))
     elif a.cmd == "compose-down":
         _out(compose_down(a.file))
+    elif a.cmd == "verify-poc":
+        r = verify_poc(a.dir, a.project, a.script, a.success_marker, a.fail_marker,
+                       a.up_timeout, a.run_timeout, a.keep)
+        _out(r)
+        raise SystemExit(0 if r.get("passed") else 3)
     elif a.cmd == "probe":
         _out(probe(a.url, a.method, a.data, a.header))
     elif a.cmd == "logs":
