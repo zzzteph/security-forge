@@ -16,6 +16,7 @@ parts and gives the agent a clean interface to state:
     verify-poc   run a finished PoC bundle end-to-end; mark `verified` ONLY if it
                  actually reproduces (exit 0 + success marker) — the advisory gate
     gc-advisories delete advisories + PoC bundles NOT backed by a reproduced finding
+    export-reports collect findings into ONE flat reports/ folder (date_project_issue) + INDEX
     notify       emit a notification locally (stdout + per-target log)
     nuke         tear down the docker verification sandbox
 """
@@ -27,10 +28,13 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import os  # noqa: E402
+import re  # noqa: E402
 import repo  # noqa: E402
 import store  # noqa: E402
-from common import (ROOT, TARGET_DIR, configure_stdio, ensure_dirs, load_config,  # noqa: E402
-                    load_env, eprint, fingerprint, now_iso)
+from common import (ROOT, TARGET_DIR, DATA_ROOT, KNOWLEDGE_ROOT, KNOWLEDGE_DIR,  # noqa: E402
+                    configure_stdio, ensure_dirs, load_config, load_env, eprint,
+                    fingerprint, now_iso, sev_rank, target_slug)
 
 configure_stdio()
 
@@ -274,6 +278,179 @@ def cmd_nuke(args) -> None:
     _print(verify.nuke())
 
 
+# --- Central report export --------------------------------------------------
+# Every finding across every project lands as one file in ONE flat folder, so the
+# vulnerabilities are browsable regardless of which repo they came from:
+#   <reports_dir>/<YYYYMMDD>_<project>_<SEV>_<issue>.md   +   INDEX.md
+
+def reports_dir(cli: str | None = None) -> Path:
+    """Central reports folder. Precedence: --reports-dir > SECFORGE_REPORTS_DIR >
+    config.yaml report.reports_dir > DATA_ROOT/reports."""
+    p = (cli or os.environ.get("SECFORGE_REPORTS_DIR") or "").strip()
+    if not p:
+        try:
+            p = ((load_config().get("report") or {}).get("reports_dir") or "").strip()
+        except SystemExit:
+            p = ""
+    return Path(p).expanduser().resolve() if p else (DATA_ROOT / "reports")
+
+
+def _rslug(s: str, n: int = 48) -> str:
+    s = re.sub(r"[^A-Za-z0-9]+", "-", (s or "").strip().lower()).strip("-")
+    return (s[:n].rstrip("-") or "issue")
+
+
+def _project_of(slug: str) -> str:
+    parts = [p for p in (slug or "").split("/") if p]
+    name = "-".join(parts[1:]) if len(parts) >= 3 else (parts[-1] if parts else slug)
+    return re.sub(r"[^A-Za-z0-9._-]", "-", name or "project") or "project"
+
+
+def _report_date(f: dict) -> str:
+    d = (f.get("first_seen") or f.get("last_seen") or f.get("updated") or now_iso())
+    return re.sub(r"[^0-9]", "", str(d)[:10]) or "00000000"
+
+
+def _report_name(f: dict, slug: str) -> str:
+    sev = (f.get("severity") or "NA").upper()
+    return (f"{_report_date(f)}_{_project_of(slug)}_{sev}_"
+            f"{_rslug(f.get('title') or f.get('category') or f.get('id'))}.txt")
+
+
+def _render_report(f: dict, slug: str) -> str:
+    """A plain, compact text report — no markdown headers/bold/fences/emoji, single
+    blank lines. Meant to be read and grepped, not rendered."""
+    lines: list[str] = []
+    lines.append(f"[{(f.get('severity') or 'NA').upper()}] {f.get('title') or f.get('id')}")
+    lines.append("")
+
+    def kv(label: str, val) -> None:
+        if val:
+            lines.append(f"{label + ':':<13} {val}")
+
+    loc = f.get("file") or ""
+    if loc and f.get("line"):
+        loc += f":{f.get('line')}"
+    cwe = f.get("cwe")
+    if isinstance(cwe, list):
+        cwe = ", ".join(cwe)
+    verified = ("yes" if f.get("poc_verified")
+                else "runtime-confirmed" if f.get("status") == "verified" else "no")
+    kv("Project", slug)
+    kv("Status", f.get("status"))
+    kv("PoC verified", verified)
+    kv("Where", loc)
+    kv("Category", f.get("category"))
+    kv("CWE", cwe)
+    kv("Commit", f.get("commit_sha") or f.get("last_commit"))
+    kv("Entry point", f.get("entrypoint"))
+
+    def section(title: str, body) -> None:
+        body = ("" if body is None else str(body)).rstrip()
+        if body:
+            lines.append("")
+            lines.append(title)
+            lines.extend(body.splitlines())
+
+    section("Reachability:", f.get("reachability"))
+    section("Severity rationale:", f.get("severity_rationale"))
+    section("PoC:", f.get("poc"))
+    section("Evidence:", str(f.get("evidence"))[:6000] if f.get("evidence") else None)
+
+    if f.get("advisory_path"):
+        lines.append("")
+        kv("Advisory", f["advisory_path"])
+    if f.get("poc_dir"):
+        kv("PoC bundle", f"{f['poc_dir']}  (docker compose up -d && python poc.py)")
+
+    lines.append("")
+    lines.append(f"id {f.get('id')} · exported {now_iso()[:10]}")
+    text = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).rstrip() + "\n"
+    return text
+
+
+def _collect_findings(all_projects: bool) -> list[tuple[dict, str]]:
+    """(finding, slug) pairs to export. Default: the current target's store; --all:
+    every project's store under knowledge/."""
+    out: list[tuple[dict, str]] = []
+    if all_projects:
+        import json as _json
+        for fp in sorted(KNOWLEDGE_ROOT.glob("*/*/*/findings.json")):
+            slug = fp.parent.relative_to(KNOWLEDGE_ROOT).as_posix()
+            try:
+                db = _json.loads(fp.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            for f in (db.values() if isinstance(db, dict) else []):
+                if f.get("id"):
+                    out.append((f, slug))
+    else:
+        slug = target_slug(os.environ.get("SECFORGE_TARGET")
+                           or os.environ.get("SECFORGE_TARGET_REPO") or "")
+        for f in store.query():
+            out.append((f, slug or (f.get("slug") or "target")))
+    return out
+
+
+def _write_index(rdir: Path, rows: list[tuple[str, dict, str]]) -> None:
+    """Plain, aligned, greppable index — no markdown table. Highest severity first."""
+    rows = sorted(rows, key=lambda r: (-sev_rank(r[1].get("severity")), r[0]))
+    out = [f"security-forge findings — {len(rows)} across all projects "
+           f"— updated {now_iso()[:16].replace('T', ' ')}", ""]
+    out.append(f"{'SEVERITY':<9} {'V':<1} {'PROJECT':<22} {'STATUS':<10} "
+               f"{'WHERE':<26} FILE")
+    for name, f, slug in rows:
+        loc = (f.get("file") or "")
+        if loc and f.get("line"):
+            loc += f":{f['line']}"
+        out.append(f"{(f.get('severity') or 'NA').upper():<9} "
+                   f"{('Y' if f.get('poc_verified') else '-'):<1} "
+                   f"{_project_of(slug)[:22]:<22} {(f.get('status') or ''):<10} "
+                   f"{loc[:26]:<26} {name}")
+    (rdir / "INDEX.txt").write_text("\n".join(out).rstrip() + "\n", encoding="utf-8")
+    # drop a stale markdown index from before the plain-text switch
+    try:
+        (rdir / "INDEX.md").unlink()
+    except OSError:
+        pass
+
+
+def cmd_export_reports(args) -> None:
+    """Export findings to the central, project-flat reports folder + a global INDEX.
+    Non-dismissed findings at/above --min-sev. Idempotent: filenames are stable, and
+    files we generated for findings that no longer qualify are pruned (tracked in a
+    manifest, so your own files in the folder are never touched)."""
+    import json as _json
+    rdir = reports_dir(args.reports_dir)
+    rdir.mkdir(parents=True, exist_ok=True)
+    floor = sev_rank(args.min_sev or "MEDIUM")
+    pairs = [(f, s) for (f, s) in _collect_findings(args.all)
+             if f.get("status") != "dismissed" and sev_rank(f.get("severity")) >= floor]
+    written, rows = [], []
+    for f, slug in pairs:
+        name = _report_name(f, slug)
+        (rdir / name).write_text(_render_report(f, slug), encoding="utf-8")
+        written.append(name)
+        rows.append((name, f, slug))
+    # prune report files we generated before but that no longer qualify
+    manifest = rdir / ".secforge_reports.json"
+    prev = []
+    if manifest.exists():
+        try:
+            prev = _json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            prev = []
+    for old in set(prev) - set(written):
+        try:
+            (rdir / old).unlink()
+        except OSError:
+            pass
+    manifest.write_text(_json.dumps(sorted(set(written))), encoding="utf-8")
+    _write_index(rdir, rows)
+    _print({"reports_dir": str(rdir), "written": len(written),
+            "pruned": len(set(prev) - set(written)), "index": str(rdir / "INDEX.txt")})
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="pipeline", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -320,6 +497,14 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("gc-advisories")
     p.add_argument("--apply", action="store_true", help="actually delete (default: dry-run)")
     p.set_defaults(fn=cmd_gc_advisories)
+
+    p = sub.add_parser("export-reports")
+    p.add_argument("--all", action="store_true", help="export EVERY project's findings "
+                   "(default: just the current target)")
+    p.add_argument("--min-sev", default="MEDIUM")
+    p.add_argument("--reports-dir", help="central folder (default: SECFORGE_REPORTS_DIR "
+                   "or <data>/reports)")
+    p.set_defaults(fn=cmd_export_reports)
 
     sub.add_parser("paths").set_defaults(fn=cmd_paths)
 

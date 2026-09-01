@@ -608,6 +608,7 @@ def process_repo(t: dict, args, logs: Path, idx: int, total) -> str:
     row = orgdb("show", "--slug", slug) or {}
     st = row.get("status")
     salvaged = salvage_partial(repo_url, st)
+    export_reports(env_extra)          # fold this repo's findings into central reports/
     dt = int(time.monotonic() - t0)
     if st == "analyzed":
         print(f"[orch]   ✓ analyzed {(row.get('analyzed_commit') or '')[:8]} "
@@ -620,6 +621,18 @@ def process_repo(t: dict, args, logs: Path, idx: int, total) -> str:
         print(f"[orch]   ✗ not completed (status={st}, rc={rc}, {dt}s)"
               f"{_salvage_str(salvaged)} — retry next run")
     return st
+
+
+def export_reports(env_extra: dict) -> None:
+    """Deterministically fold a repo's findings into the central, project-flat
+    reports/ folder (+ INDEX) after each session — so the vulnerabilities are
+    browsable in one place regardless of backend/model. Best-effort; never fatal."""
+    try:
+        subprocess.run([PY, str(ROOT / "scripts" / "pipeline.py"), "export-reports"],
+                       cwd=str(ROOT), capture_output=True, text=True,
+                       env={**os.environ, **env_extra}, timeout=120)
+    except Exception:  # noqa: BLE001  (reporting is a convenience, not the cycle)
+        pass
 
 
 def salvage_partial(repo_url: str, status: str | None) -> dict | None:
@@ -742,6 +755,11 @@ def main():
                          "state). Defaults to the repo folder; set this to keep "
                          "results out of the hidden ~/.claude/plugins cache. Sets "
                          "SECFORGE_DATA_DIR for every session it launches.")
+    ap.add_argument("--reports-dir", default="",
+                    help="central folder where EVERY finding across ALL projects is "
+                         "written as a plain-text <date>_<project>_<severity>_<issue>"
+                         ".txt plus a greppable INDEX.txt — one flat place to browse "
+                         "vulnerabilities regardless of project (default: <data>/reports).")
     ap.add_argument("--no-sync", action="store_true",
                     help="skip the org sync (drain the DB as-is)")
     ap.add_argument("--rescan", action="store_true",
@@ -803,6 +821,8 @@ def main():
     # Redirect all artifacts before anything touches the DB; children inherit it.
     if args.output_dir:
         os.environ["SECFORGE_DATA_DIR"] = str(Path(args.output_dir).expanduser().resolve())
+    if args.reports_dir:
+        os.environ["SECFORGE_REPORTS_DIR"] = str(Path(args.reports_dir).expanduser().resolve())
     data = data_root()
     logs = data / "logs"
     logs.mkdir(parents=True, exist_ok=True)

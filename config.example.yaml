@@ -97,6 +97,11 @@ report:
   attach_report_file: true       # reference a markdown report file for confirmed findings
   progress: true                 # emit per-phase progress lines so you can watch a run live
   progress_silent: true          # …tagged as progress (not a finding/summary notice)
+  # Central report folder — every finding across ALL projects is written here as a flat,
+  # plain-text <date>_<project>_<severity>_<issue>.txt plus a greppable INDEX.txt, so you
+  # can browse the vulnerabilities in one place regardless of project. Default: <data>/reports.
+  # Override with an absolute path (or SECFORGE_REPORTS_DIR / orchestrate --reports-dir):
+  reports_dir: ""                # e.g. /home/me/security-reports
 
 verify:
   # Dynamic-verification sandbox behavior.

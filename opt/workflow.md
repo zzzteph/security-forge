@@ -668,6 +668,11 @@ own choice locally. Just make sure the model + findings JSON are written under
 # is swept:
 SECFORGE_TARGET_REPO="<url>" python scripts/pipeline.py gc-advisories            # preview
 SECFORGE_TARGET_REPO="<url>" python scripts/pipeline.py gc-advisories --apply     # remove orphans
+# Central, project-flat report folder — every finding as a plain-text
+# <date>_<project>_<sev>_<issue>.txt + a greppable INDEX.txt, so vulnerabilities are
+# browsable in one place across all repos (the orchestrator also runs this after each
+# session; harmless to run again):
+SECFORGE_TARGET_REPO="<url>" python scripts/pipeline.py export-reports
 SECFORGE_TARGET_REPO="<url>" python scripts/pipeline.py notify "✅ security-forge cycle: {repo}@{short_commit} — {n_new} new, {n_verified} verified, {n_candidates} candidates, {n_fixed} mitigated, {n_advisories} advisories, {n_sent} sent."   # if report.cycle_summary
 SECFORGE_TARGET_REPO="<url>" python scripts/pipeline.py nuke   # tear down Docker sandbox — ALWAYS
 ```
