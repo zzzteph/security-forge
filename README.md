@@ -76,3 +76,77 @@ committed SQLite DB (`db/security-forge.db`) so one copy of security-forge becom
 the durable memory of your whole org. It's fully resumable, and `--rescan`
 re-analyzes only the repos that changed. Full flags and DB queries are in
 [docs/ORCHESTRATION.md](docs/ORCHESTRATION.md).
+
+## Examples
+
+```bash
+# --- Targets --------------------------------------------------------------
+python orchestrate.py --repo https://github.com/OWNER/REPO   # one remote repo
+python orchestrate.py --org OWNER                            # a whole GitHub org
+python orchestrate.py --path /home/me/projectX              # a LOCAL folder (git or not)
+python orchestrate.py --path ./services/api                 # relative path works too
+
+# --- Re-checking your own repos (no org discovery) ------------------------
+python orchestrate.py --known-only                          # re-check ONLY repos you've analyzed
+python orchestrate.py --rescan --org OWNER                  # re-list an org + analyze what changed
+
+# --- Choosing the AI backend ----------------------------------------------
+python orchestrate.py --org OWNER --model opus4.8           # Claude Code (default)
+python orchestrate.py --org OWNER --backend litellm --model openai/gpt-5 \
+  --agent-env OPENAI_API_KEY=sk-...                         # native LiteLLM (no external CLI)
+python orchestrate.py --path ./app --backend litellm --model ollama/llama3 \
+  --agent-base-url http://localhost:11434                   # fully local model, offline
+python orchestrate.py --org OWNER --backend codex --model gpt-5   # wrap the Codex CLI (preset)
+python orchestrate.py --repo <url> \
+  --agent-cmd "aider --model {model} --yes --message {prompt}" --model gpt-5   # any CLI, inline
+
+# --- Where results go -----------------------------------------------------
+python orchestrate.py --org OWNER --output-dir /data/sf \
+  --reports-dir /data/security-reports                     # flat, cross-project reports/ folder
+
+# Browse everything found, across all projects, in one place:
+cat /data/security-reports/INDEX.txt
+```
+
+Every finding across every project is also collected into one flat, plain-text
+folder — `reports/<date>_<project>_<severity>_<issue>.txt` plus a greppable
+`INDEX.txt` — so you can review vulnerabilities regardless of which repo they came
+from. Advisories and a runnable PoC are written only for findings whose exploit
+actually reproduced.
+
+## Run it in Docker
+
+Published to GHCR on every push (multi-arch: amd64 + arm64/Raspberry Pi):
+
+```bash
+docker pull ghcr.io/zzzteph/security-forge:latest
+```
+
+security-forge runs its own verification sandbox, so give the container a Docker
+daemon (mount the host socket) and, on Linux, host networking so the sandbox's
+port-binding and probes line up:
+
+```bash
+# analyze a local folder with Claude Code
+docker run --rm -it \
+  --network host \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v "$PWD/sf-data:/data" \
+  -e ANTHROPIC_API_KEY=sk-... \
+  ghcr.io/zzzteph/security-forge:latest --path /data/mysrc --model opus4.8
+
+# or a whole org with the native LiteLLM backend (no Claude CLI needed)
+docker run --rm -it \
+  --network host \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v "$PWD/sf-data:/data" \
+  -e OPENAI_API_KEY=sk-... \
+  ghcr.io/zzzteph/security-forge:latest \
+  --org OWNER --backend litellm --model openai/gpt-5
+```
+
+Put source to analyze under `./sf-data` (mounted at `/data`) and everything —
+`db/`, `knowledge/`, and the central `reports/` — persists there. There's also a
+`docker-compose.yml` for convenience, and you can build locally with
+`docker build -t security-forge .` (add `--build-arg INSTALL_CLAUDE=false` for a
+lean, LiteLLM-only image). Full details in [docs/DOCKER.md](docs/DOCKER.md).

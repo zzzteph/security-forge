@@ -1,0 +1,29 @@
+# Keep the build context small and never bake in secrets or local run data.
+# NOTE: the pipeline READS opt/, sast/, docs/, and .claude/agents/*.md at runtime,
+# so those stay in the image — only data/logs/secrets are excluded here.
+.git/
+.gitattributes
+**/__pycache__/
+*.pyc
+*.pyo
+
+# secrets & local env (the template is fine to keep)
+.env
+.env.*
+!.env.example
+
+# per-run artifacts / local results (live in the mounted /data volume instead)
+target/
+state/
+db/
+knowledge/
+reports/
+logs/
+orch-*.log
+*.log
+scratchpad/
+
+# editor / OS noise
+.idea/
+.vscode/
+.DS_Store

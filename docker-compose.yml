@@ -1,0 +1,26 @@
+# Convenience runner for the security-forge image.
+#
+#   docker compose build                       # or: docker compose pull
+#   ANTHROPIC_API_KEY=sk-... docker compose run --rm security-forge --path /data/mysrc --model opus4.8
+#
+# Put source you want analyzed under ./sf-data (mounted at /data) and point --path there.
+services:
+  security-forge:
+    build: .
+    image: ghcr.io/zzzteph/security-forge:latest
+    # Linux host: host networking makes the verify sandbox's 127.0.0.1 port-binding
+    # and HTTP probes line up with the containers it launches on the host daemon.
+    network_mode: host
+    volumes:
+      # Docker-out-of-Docker: run the verification sandbox on the host daemon.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Persist db / knowledge / reports / logs (and stage local source to analyze).
+      - ./sf-data:/data
+    environment:
+      # Set only the ones your backend/targets need.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}   # claude-code backend
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}         # litellm/codex/aider
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}         # gemini
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}             # private repo listing/cloning
+    # Override per run on the command line (this is the default when none given):
+    command: ["--help"]
