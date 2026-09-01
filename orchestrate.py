@@ -53,6 +53,19 @@ def _path_segments(url: str) -> list[str]:
     return [p for p in s.strip("/").replace("\\", "/").split("/") if p]
 
 
+def _looks_local(value: str) -> bool:
+    """A LOCAL source folder rather than a remote URL — by shape (mirrors
+    common.is_local_path so the orchestrator needn't import the scripts package)."""
+    s = (value or "").strip()
+    if not s:
+        return False
+    if s.startswith("file://"):
+        return True
+    if s in (".", "..") or s.startswith(("/", "./", "../", "~/", "~\\", ".\\", "..\\")):
+        return True
+    return bool(re.match(r"^[A-Za-z]:[\\/]", s)) or s.startswith("\\\\")
+
+
 def normalize_model(m: str) -> str:
     """Turn a friendly model name into the id the Claude Code CLI accepts.
     Passes through bare aliases (opus/sonnet/haiku/default) and anything already
@@ -92,13 +105,15 @@ def org(*a):
     return _helper_json("org.py", *a)
 
 
-def pending_count(rescan: bool = False) -> int:
-    a = ["pending"] + (["--rescan"] if rescan else [])
+def pending_count(rescan: bool = False, known_only: bool = False) -> int:
+    a = ["pending"] + (["--rescan"] if rescan else []) + (["--known-only"] if known_only else [])
     return int((orgdb(*a) or {}).get("pending", 0))
 
 
-def next_targets(count: int, rescan: bool = False) -> list:
-    a = ["next-batch", "--count", str(count)] + (["--rescan"] if rescan else [])
+def next_targets(count: int, rescan: bool = False, known_only: bool = False) -> list:
+    a = (["next-batch", "--count", str(count)]
+         + (["--rescan"] if rescan else [])
+         + (["--known-only"] if known_only else []))
     r = orgdb(*a)
     return [t for t in r if t.get("slug")] if isinstance(r, list) else []
 
@@ -405,11 +420,13 @@ class LiteLLMBackend(AgentBackend):
 
     name = "litellm"
 
-    def __init__(self, max_turns=None, temperature=None, max_context_tokens=None):
+    def __init__(self, max_turns=None, temperature=None, max_context_tokens=None,
+                 api_base=None):
         self.script = ROOT / "scripts" / "litellm_agent.py"
         self.max_turns = max_turns
         self.temperature = temperature
         self.max_context_tokens = max_context_tokens
+        self.api_base = api_base
 
     def build_command(self, prompt: str, model: str) -> list[str]:
         cmd = [PY, str(self.script), "--model", model or "", "--prompt", prompt]
@@ -419,6 +436,8 @@ class LiteLLMBackend(AgentBackend):
             cmd += ["--temperature", str(self.temperature)]
         if self.max_context_tokens:
             cmd += ["--max-context-tokens", str(self.max_context_tokens)]
+        if self.api_base:
+            cmd += ["--api-base", self.api_base]
         return cmd
 
     def progress(self, log_path: Path):
@@ -538,7 +557,8 @@ def resolve_backend(args, cfg: dict) -> AgentBackend:
         temp = (args.agent_temperature if args.agent_temperature is not None
                 else lc.get("temperature"))
         mct = lc.get("max_context_tokens")
-        return LiteLLMBackend(mt, temp, mct)
+        base = (args.agent_base_url or lc.get("api_base") or "").strip() or None
+        return LiteLLMBackend(mt, temp, mct, base)
 
     if name == "cli-adapter":
         cli = cfg.get("cli") or {}
@@ -654,7 +674,12 @@ def main():
                    "https://github.example.com/my-org for GitHub Enterprise "
                    "Server (its API is <host>/api/v3).")
     g.add_argument("--user", help="GitHub user account (same host forms as --org)")
-    g.add_argument("--repo", help="analyze a SINGLE repo URL (one session), then stop")
+    g.add_argument("--repo", help="analyze a SINGLE repo URL (one session), then "
+                   "stop. Also accepts a LOCAL folder path or file:// URL — the same "
+                   "as --path.")
+    g.add_argument("--path", help="analyze a SINGLE LOCAL source folder (one "
+                   "session), then stop — a git repo is cloned (diffs work) or a "
+                   "plain folder is copied. Keyed as local/<foldername>.")
     ap.add_argument("--include-forks", action="store_true")
     ap.add_argument("--include-archived", action="store_true")
     ap.add_argument("--timeout", type=int, default=3600,
@@ -696,6 +721,12 @@ def main():
                          "default 500). The per-repo --timeout still bounds wall clock.")
     ap.add_argument("--agent-temperature", type=float, default=None,
                     help="litellm backend: sampling temperature (provider default if unset)")
+    ap.add_argument("--agent-base-url", default="",
+                    help="litellm backend: override the model endpoint URL (a "
+                         "self-hosted OpenAI-compatible server, Ollama/vLLM, or a "
+                         "LiteLLM proxy), e.g. http://localhost:4000 . The API key "
+                         "still comes from the env (--agent-env OPENAI_API_KEY=… or "
+                         "--agent-env SECFORGE_LLM_API_KEY=… for a generic endpoint).")
     ap.add_argument("--model", default="", help="optional model to pass through "
                     "(claude-code: normalized, e.g. opus4.8 -> claude-opus-4-8; "
                     "cli-adapter: passed verbatim, e.g. gpt-5, gemini-2.5-pro)")
@@ -716,6 +747,12 @@ def main():
     ap.add_argument("--rescan", action="store_true",
                     help="re-sync and re-queue already-analyzed repos whose upstream "
                          "changed since last analysis, then re-analyze just the diffs")
+    ap.add_argument("--known-only", action="store_true",
+                    help="re-check ONLY repos you've already analyzed (that have a "
+                         "model in knowledge/) — your repos, NOT their whole orgs. "
+                         "Skips all org discovery/sync; each session pulls latest and "
+                         "analyzes just the diff. Use this (instead of --rescan) to "
+                         "sync the latest for your known repos after a backfill.")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the plan and launch nothing")
     args = ap.parse_args()
@@ -748,8 +785,20 @@ def main():
               "<litellm model> (e.g. openai/gpt-5, gemini/gemini-2.5-pro, "
               "ollama/llama3) or set config.yaml agent.model.", file=sys.stderr)
         raise SystemExit(2)
+    _base = getattr(args._backend, "api_base", None)
     print(f"[orch] backend={args._backend.name}"
-          f"{' model=' + args.model if args.model else ''}", flush=True)
+          f"{' model=' + args.model if args.model else ''}"
+          f"{' base=' + _base if _base else ''}", flush=True)
+
+    # `--rescan` with NO explicit --org/--user means "re-check the repos I already
+    # analyzed" — NOT "re-list every org they belong to" (which discovers thousands
+    # of unrelated repos). Fold it into known-only so the common `--rescan` is safe;
+    # org-wide discovery stays opt-in via `--rescan --org OWNER` (or `--org OWNER`).
+    if args.rescan and not (args.org or args.user) and not args.known_only:
+        print("[orch] --rescan (no --org): re-checking only your analyzed repos "
+              "(--known-only). For org-wide discovery use --rescan --org OWNER.",
+              flush=True)
+        args.known_only = True
 
     # Redirect all artifacts before anything touches the DB; children inherit it.
     if args.output_dir:
@@ -761,14 +810,24 @@ def main():
 
     orgdb("init")
 
-    # Single-repo mode: enqueue the one repo and run exactly one session, then stop.
-    if args.repo:
-        segs = _path_segments(args.repo)
-        if len(segs) < 3:
-            owner_url = args.repo.rstrip("/")
+    # Single-target mode: enqueue one repo/folder, run exactly one session, then stop.
+    single = args.repo or args.path
+    if single:
+        is_local = bool(args.path) or _looks_local(single)
+        if is_local:
+            p = Path(single[len("file://"):] if single.startswith("file://")
+                     else single).expanduser()
+            if not p.is_dir():
+                print(f"[orch] ERROR: local source folder not found: {p}",
+                      file=sys.stderr)
+                raise SystemExit(2)
+            single = str(p.resolve())        # canonical path (stable slug + clone src)
+        elif len(_path_segments(single)) < 3:
+            segs = _path_segments(single)
+            owner_url = single.rstrip("/")
             print(f"[orch] ERROR: --repo needs a full host/owner/repo URL, but "
-                  f"'{args.repo}' has no repo segment (parsed {'/'.join(segs) or '∅'}).",
-                  file=sys.stderr)
+                  f"'{single}' has no repo segment (parsed {'/'.join(segs) or '∅'}). "
+                  f"For a LOCAL folder use --path <dir>.", file=sys.stderr)
             if len(segs) == 2:
                 print(f"[orch]        '{segs[1]}' looks like an org/user. To scan "
                       f"all its repos use:\n"
@@ -778,13 +837,14 @@ def main():
             raise SystemExit(2)
         if not args.dry_run:
             orgdb("reap-stale", "--max-attempts", str(args.max_attempts))
-        row = orgdb("add", "--repo", args.repo) or {"slug": args.repo, "repo_url": args.repo}
-        slug = row.get("slug") or args.repo
+        row = orgdb("add", "--repo", single) or {"slug": single, "repo_url": single}
+        slug = row.get("slug") or single
         if args.dry_run:
-            print(f"[orch] (1) would analyze single repo {slug}")
+            kind = "local folder" if is_local else "repo"
+            print(f"[orch] (1) would analyze single {kind} {single} (slug {slug})")
             return
-        print(f"[orch] single-repo mode; heartbeat every {args.heartbeat}s; "
-              f"tail -f {logs}/orch-*.log", flush=True)
+        print(f"[orch] single-target mode ({'local folder' if is_local else 'repo'}); "
+              f"heartbeat every {args.heartbeat}s; tail -f {logs}/orch-*.log", flush=True)
         st = process_repo(row, args, logs, 1, 1)
         print(f"\n[orch] done. {slug} -> {st}")
         return
@@ -793,7 +853,21 @@ def main():
             (["--include-archived"] if args.include_archived else [])
     if not args.dry_run:
         orgdb("reap-stale", "--max-attempts", str(args.max_attempts))
-        if (args.org or args.user) and not args.no_sync:
+        if args.known_only:
+            # Re-check only repos already analyzed (a model in knowledge/). Sync the
+            # durable knowledge/ into the DB first (idempotent — works on a fresh box
+            # or after a DB wipe), then re-check exactly those. NO org discovery, so
+            # a repo's whole org is never pulled in.
+            bf = orgdb("backfill") or {}
+            if bf.get("targets"):
+                print(f"[orch] known-only: {bf['targets']} analyzed repo(s) from "
+                      f"knowledge/ ({bf.get('findings_synced', 0)} findings) — "
+                      f"re-checking just these, not re-listing their orgs.", flush=True)
+            else:
+                print("[orch] known-only: no analyzed repos in knowledge/ to re-check "
+                      "— run `--org OWNER` (or `--repo`/`--path`) to analyze some first.",
+                      flush=True)
+        elif (args.org or args.user) and not args.no_sync:
             who = ["--org", args.org] if args.org else ["--user", args.user]
             s = org("sync", *who, *extra) or {}
             print(f"[orch] synced {s.get('kind','?')} "
@@ -802,31 +876,10 @@ def main():
                   f"listed={s.get('listed','?')} queued={s.get('queued','?')} "
                   f"filtered_out={s.get('filtered_out','?')} "
                   f"(archived={s.get('skipped_archived',0)} forks={s.get('skipped_forks',0)})")
-        elif args.rescan and not args.no_sync:
-            # rescan without an explicit owner: refresh every owner we already track.
-            owners = (orgdb("owners") or {}).get("owners", [])
-            if not owners:
-                # The DB is local/gitignored; knowledge/ is the durable state. On a
-                # fresh box (or after a DB wipe) the queue is empty while every model
-                # is still on disk — rebuild the queue from knowledge/ so a bare
-                # --rescan actually has something to re-check.
-                bf = orgdb("backfill") or {}
-                if bf.get("targets"):
-                    print(f"[orch] queue was empty — backfilled {bf['targets']} target(s) "
-                          f"from local knowledge/ ({bf.get('findings_synced', 0)} findings, "
-                          f"{bf.get('found', 0)} models).", flush=True)
-                    owners = bf.get("owners") or (orgdb("owners") or {}).get("owners", [])
-            if not owners:
-                print("[orch] --rescan: no owners tracked and no local models to "
-                      "backfill — run `--org OWNER` (or `--user NAME`) once to "
-                      "populate the queue.", flush=True)
-            for owner in owners:
-                s = org("sync", "--org", owner, *extra) or {}
-                print(f"[orch] re-synced {owner}: listed={s.get('listed','?')} "
-                      f"queued={s.get('queued','?')}")
 
-    total = pending_count(rescan=args.rescan)
-    mode = "rescan (new + changed)" if args.rescan else "sweep (new only)"
+    total = pending_count(rescan=args.rescan, known_only=args.known_only)
+    mode = ("known-only (re-check analyzed)" if args.known_only
+            else "rescan (new + changed)" if args.rescan else "sweep (new only)")
     print(f"[orch] mode={mode} pending={total} timeout={args.timeout}s"
           f"{' (DRY-RUN)' if args.dry_run else ''}")
     if not args.dry_run:
@@ -837,7 +890,8 @@ def main():
     while True:
         if args.max_repos and n >= args.max_repos:
             break
-        batch = [t for t in next_targets(200, rescan=args.rescan) if t.get("slug") not in attempted]
+        batch = [t for t in next_targets(200, rescan=args.rescan, known_only=args.known_only)
+                 if t.get("slug") not in attempted]
         if not batch:
             break
         for t in batch:
@@ -855,7 +909,7 @@ def main():
 
     print(f"\n[orch] done. sessions={n} analyzed={analyzed} "
           f"error(retry later)={errored} skipped={skipped} "
-          f"remaining≈{pending_count(rescan=args.rescan)}")
+          f"remaining≈{pending_count(rescan=args.rescan, known_only=args.known_only)}")
 
 
 if __name__ == "__main__":

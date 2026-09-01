@@ -26,6 +26,31 @@ ROOT = Path(__file__).resolve().parent.parent
 DATA_ROOT = Path(os.environ.get("SECFORGE_DATA_DIR") or ROOT).expanduser().resolve()
 
 
+def is_local_path(value: str) -> bool:
+    """True when `value` names a LOCAL source folder rather than a remote git URL:
+    a `file://` URL, an absolute/relative POSIX path (`/…`, `./…`, `../…`, `~/…`),
+    a Windows drive path (`C:\\…`), or a UNC share (`\\\\host\\…`). Purely by shape,
+    so the answer is stable even after the folder moves or disappears."""
+    s = (value or "").strip()
+    if not s:
+        return False
+    if s.startswith("file://"):
+        return True
+    if s in (".", "..") or s.startswith(("/", "./", "../", "~/", "~\\", ".\\", "..\\")):
+        return True
+    if re.match(r"^[A-Za-z]:[\\/]", s):     # C:\ or C:/
+        return True
+    if s.startswith("\\\\"):                # UNC \\server\share
+        return True
+    return False
+
+
+def local_path_of(value: str) -> str:
+    """The filesystem path a local target points at (strips a `file://` scheme)."""
+    s = (value or "").strip()
+    return s[len("file://"):] if s.startswith("file://") else s
+
+
 def target_slug(value: str) -> str:
     """Normalize a repo URL (or an existing slug) to a filesystem-safe
     host/owner/repo key, so ONE security-forge copy can track MANY targets.
@@ -33,10 +58,15 @@ def target_slug(value: str) -> str:
     'https://u:tok@github.com/owner/App.git' -> 'github.com/owner/App'
     'git@github.com:owner/app.git'           -> 'github.com/owner/app'
     'github.com/owner/app' (already a slug)  -> 'github.com/owner/app'
+    '/home/me/projectX'  (a local folder)    -> 'local/projectX'
     """
     s = (value or "").strip()
     if not s:
         return ""
+    if is_local_path(s):                 # a local source folder -> local/<basename>
+        p = local_path_of(s).replace("\\", "/").rstrip("/")
+        base = p.split("/")[-1] or "local"
+        return "local/" + (re.sub(r"[^A-Za-z0-9._-]", "-", base) or "local")
     if "://" in s:                       # strip scheme
         s = s.split("://", 1)[1]
     elif s.startswith("git@"):           # scp-like ssh form

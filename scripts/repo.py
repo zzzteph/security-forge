@@ -12,9 +12,11 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import TARGET_DIR, STATE_DIR, run, eprint, target_repo, load_env  # noqa: E402
+from common import (TARGET_DIR, STATE_DIR, run, eprint, target_repo, load_env,  # noqa: E402
+                    is_local_path, local_path_of)
 
 LAST_COMMIT = STATE_DIR / "last_commit.txt"
+TREE_MANIFEST = STATE_DIR / "tree_manifest.json"
 
 _GH_COM = {"github.com", "www.github.com"}
 
@@ -107,15 +109,108 @@ def write_last_commit(commit: str | None) -> None:
     LAST_COMMIT.write_text(commit or "", encoding="utf-8")
 
 
+def _tree_manifest(root: Path) -> dict:
+    """Cheap signature of a non-git source tree: {relpath: 'size:mtime'}, skipping
+    the usual noise dirs. Lets a LOCAL folder get real changed-file detection
+    (incremental analysis) without git."""
+    man: dict = {}
+    if not root.is_dir():
+        return man
+    for p in root.rglob("*"):
+        rel = p.relative_to(root)
+        if any(part in SKIP_DIRS for part in rel.parts):
+            continue
+        if p.is_file():
+            try:
+                st = p.stat()
+                man[rel.as_posix()] = f"{st.st_size}:{int(st.st_mtime)}"
+            except OSError:
+                continue
+    return man
+
+
+def _manifest_diff(old: dict, new: dict) -> list[str]:
+    return sorted(k for k in set(old) | set(new) if old.get(k) != new.get(k))
+
+
+def _copy_tree(src: Path, dst: Path) -> None:
+    import shutil
+    if dst.exists():
+        shutil.rmtree(dst, ignore_errors=True)
+    shutil.copytree(src, dst, ignore=shutil.ignore_patterns(*SKIP_DIRS),
+                    symlinks=False, ignore_dangling_symlinks=True)
+
+
+def _prep_local(url: str, branch: str | None, depth, prev: str | None) -> dict:
+    """Prepare a LOCAL source folder as the target. If it's a git repo, clone it
+    into the throwaway target/ (keeps history, so diffs work like a remote); if
+    it's just a folder of files, copy it and detect changes via a tree manifest."""
+    src = Path(local_path_of(url)).expanduser().resolve()
+    if not src.is_dir():
+        raise SystemExit(f"[repo] local source folder not found: {src}")
+    is_git = (src / ".git").is_dir()
+
+    if is_git:
+        if not (TARGET_DIR / ".git").exists():
+            eprint(f"[repo] cloning local git repo {src}")
+            args = ["clone"]
+            if depth:
+                args += ["--depth", str(depth)]
+            if branch:
+                args += ["--branch", branch]
+            args += [str(src), str(TARGET_DIR)]
+            rc, _, err = run(["git", *args], env=_git_env())
+            if rc != 0:
+                raise SystemExit(f"[repo] local clone failed: {err}")
+        else:
+            eprint("[repo] refreshing local clone")
+            git(["fetch", "--all", "--prune", "--tags"])
+            rc, out, _ = git(["rev-parse", "--abbrev-ref", "HEAD"])
+            cur_branch = branch or (out.strip() if rc == 0 else "HEAD")
+            if branch:
+                git(["checkout", branch])
+            git(["reset", "--hard", f"origin/{cur_branch}"])
+        new = current_commit()
+        changed = _diff_files(prev, new)
+        return {"repo": str(src), "branch": branch, "prev_commit": prev,
+                "commit": new, "changed_files": changed, "changed_count": len(changed),
+                "is_first_scan": prev is None, "local": True, "vcs": "git"}
+
+    # Non-git folder: copy it in and diff by file-signature manifest.
+    eprint(f"[repo] copying local folder {src} (no git — using tree manifest)")
+    _copy_tree(src, TARGET_DIR)
+    old_man = {}
+    if TREE_MANIFEST.exists():
+        try:
+            import json
+            old_man = json.loads(TREE_MANIFEST.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            old_man = {}
+    new_man = _tree_manifest(TARGET_DIR)
+    import hashlib
+    import json
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    TREE_MANIFEST.write_text(json.dumps(new_man, ensure_ascii=False), encoding="utf-8")
+    tree_hash = hashlib.sha1(
+        json.dumps(new_man, sort_keys=True).encode("utf-8")).hexdigest()
+    changed = _manifest_diff(old_man, new_man) if old_man else []
+    return {"repo": str(src), "branch": None, "prev_commit": prev,
+            "commit": tree_hash, "changed_files": changed, "changed_count": len(changed),
+            "is_first_scan": prev is None, "local": True, "vcs": "none"}
+
+
 def clone_or_update(cfg: dict) -> dict:
     target = cfg.get("target", {}) or {}
     url = target_repo(cfg)   # SECFORGE_TARGET_REPO env overrides config.yaml
     branch = (target.get("branch") or "").strip() or None
     depth = target.get("depth")  # None = full history (needed for secret scanning)
     if not url:
-        raise SystemExit("config.yaml: target.repo is empty. Set the GitHub URL to analyze.")
+        raise SystemExit("config.yaml: target.repo is empty. Set the GitHub URL "
+                         "(or a local folder path) to analyze.")
 
     prev = read_last_commit()
+    if is_local_path(url):               # a local source folder, not a remote URL
+        return _prep_local(url, branch, depth, prev)
     if not (TARGET_DIR / ".git").exists():
         eprint(f"[repo] cloning {url}")
         args = ["clone"]

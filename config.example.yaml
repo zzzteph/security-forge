@@ -6,7 +6,10 @@ target:
   # GitHub (or any git) URL to clone into ./target and analyze.
   # For private repos use an authenticated URL, e.g.
   #   https://<user>:<token>@github.com/owner/repo.git
-  repo: ""                       # e.g. https://github.com/owner/repo.git
+  # Or a LOCAL SOURCE FOLDER — an absolute/relative path or file:// URL (a git repo
+  # is cloned with history; a plain folder is copied). Keyed as local/<foldername>.
+  #   repo: /home/me/projectX            # or ./services/api  or  file:///srv/code/app
+  repo: ""                       # e.g. https://github.com/owner/repo.git  |  /path/to/local/folder
   branch: ""                     # blank = default branch
   depth: null                    # null = full history (needed for secret scanning); or an int for shallow
 
@@ -29,6 +32,10 @@ agent:
     max_turns: 500               # max tool-use turns per session (wall clock still bounded by --timeout)
     temperature: null            # null = provider default
     max_context_tokens: 120000   # trim old tool output above this to stay in the model's window
+    api_base: ""                 # override the model endpoint URL: a self-hosted OpenAI-compatible
+                                 # server, Ollama/vLLM, or a LiteLLM proxy (e.g. http://localhost:4000).
+                                 # Key stays in the env: OPENAI_API_KEY, or SECFORGE_LLM_API_KEY for a
+                                 # generic endpoint. (CLI: --agent-base-url)
 
   # Ad-hoc wrapper for one-off use: `--backend cli-adapter` runs this template.
   cli:

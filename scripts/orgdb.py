@@ -235,18 +235,24 @@ def get(slug: str) -> dict | None:
 
 
 def next_batch(count: int = 10, pushed_since: str | None = None,
-               rescan: bool = False) -> list[dict]:
+               rescan: bool = False, known_only: bool = False) -> list[dict]:
     """Repos due for analysis, freshest push first.
 
     Default (initial sweep): never-analyzed repos + any left in `error`.
     rescan=True: ALSO re-queue analyzed repos whose upstream `pushed_at` differs
     from the snapshot taken when we last analyzed them — i.e. a repo that got new
-    commits (a diff) since. The per-repo session then analyzes just the diff."""
+    commits (a diff) since. The per-repo session then analyzes just the diff.
+    known_only=True: ONLY repos already analyzed at least once (have a durable
+    model in knowledge/) — re-check exactly those, ignoring org discovery. This is
+    the "just my repos, not their whole orgs" mode."""
     init()
-    due = ["analyzed_at IS NULL", "status = 'error'"]
-    if rescan:
-        due.append("(pushed_at IS NOT NULL AND "
-                   "(analyzed_pushed_at IS NULL OR pushed_at != analyzed_pushed_at))")
+    if known_only:
+        due = ["analyzed_at IS NOT NULL"]
+    else:
+        due = ["analyzed_at IS NULL", "status = 'error'"]
+        if rescan:
+            due.append("(pushed_at IS NOT NULL AND "
+                       "(analyzed_pushed_at IS NULL OR pushed_at != analyzed_pushed_at))")
     q = [
         "SELECT * FROM targets",
         "WHERE status != 'skipped'",
@@ -262,8 +268,10 @@ def next_batch(count: int = 10, pushed_since: str | None = None,
         return [dict(r) for r in c.execute("\n".join(q), tuple(vals)).fetchall()]
 
 
-def pending_count(pushed_since: str | None = None, rescan: bool = False) -> int:
-    return len(next_batch(count=10_000_000, pushed_since=pushed_since, rescan=rescan))
+def pending_count(pushed_since: str | None = None, rescan: bool = False,
+                  known_only: bool = False) -> int:
+    return len(next_batch(count=10_000_000, pushed_since=pushed_since,
+                          rescan=rescan, known_only=known_only))
 
 
 _GH_COM_HOSTS = {"github.com", "www.github.com", "api.github.com"}
@@ -443,7 +451,9 @@ def main() -> None:
     p = sub.add_parser("findings"); p.add_argument("--slug"); p.add_argument("--min-sev"); p.add_argument("--status"); p.add_argument("--limit", type=int, default=50)
     p = sub.add_parser("next-batch"); p.add_argument("--count", type=int, default=10)
     p.add_argument("--pushed-since"); p.add_argument("--rescan", action="store_true")
+    p.add_argument("--known-only", action="store_true")
     p = sub.add_parser("pending"); p.add_argument("--pushed-since"); p.add_argument("--rescan", action="store_true")
+    p.add_argument("--known-only", action="store_true")
     sub.add_parser("owners")
     p = sub.add_parser("show"); p.add_argument("--slug", required=True)
     p = sub.add_parser("set-status"); p.add_argument("--slug", required=True)
@@ -478,9 +488,11 @@ def main() -> None:
     elif args.cmd == "findings":
         _print(query_findings(args.slug, args.min_sev, args.status, args.limit))
     elif args.cmd == "next-batch":
-        _print(next_batch(args.count, args.pushed_since, rescan=args.rescan))
+        _print(next_batch(args.count, args.pushed_since, rescan=args.rescan,
+                          known_only=args.known_only))
     elif args.cmd == "pending":
-        _print({"pending": pending_count(args.pushed_since, rescan=args.rescan)})
+        _print({"pending": pending_count(args.pushed_since, rescan=args.rescan,
+                                         known_only=args.known_only)})
     elif args.cmd == "owners":
         _print({"owners": owners()})
     elif args.cmd == "show":

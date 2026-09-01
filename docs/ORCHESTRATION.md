@@ -64,6 +64,24 @@ just run the skill, `/security-forge https://github.com/owner/repo`, or the
 workflow directly. `--repo` is the headless equivalent that also records the
 result into the DB alongside your org runs.
 
+## Local source folders (no clone URL needed)
+
+Point security-forge straight at code already on disk — a checkout, a vendored
+drop, a folder that never had a remote:
+
+```bash
+python orchestrate.py --path /home/me/projectX          # one local folder, one session
+python orchestrate.py --path ./services/api             # relative paths work too
+python orchestrate.py --repo file:///srv/code/app       # file:// URL is equivalent
+```
+
+A local target is keyed as **`local/<foldername>`** (so its model/findings live in
+`knowledge/local/<foldername>/`). If the folder is a **git repo** it's cloned into
+the throwaway `target/` with history, so incremental diffs work exactly like a
+remote. If it's a **plain folder** (no `.git`) it's copied, and changed files are
+detected by a file-signature manifest — so re-running still analyzes just what
+changed. `config.yaml → target.repo` also accepts a path or `file://` URL.
+
 The wrappers `drain.sh` / `drain.ps1` do the same and relaunch the orchestrator if
 its own process dies, until the queue is empty. Extra flags pass straight through.
 
@@ -129,6 +147,15 @@ method).
 - **`--rescan`:** re-syncs the org, then re-queues any analyzed repo whose upstream
   `pushed_at` changed since we analyzed it. The per-repo session clones the new
   commit, diffs against the last analyzed commit, and analyzes just the changes.
+  Note: `--rescan` **re-lists the whole org** of every repo it tracks, so it also
+  discovers and queues repos you never analyzed. If you only want to refresh YOUR
+  repos, use `--known-only`.
+- **`--known-only`:** re-check ONLY the repos you've already analyzed (that have a
+  model in `knowledge/`) — your repos, **not their whole orgs**. Skips all org
+  discovery/sync; each session pulls latest and analyzes just the diff. This is the
+  right "sync the latest for my repos" mode, especially right after a `backfill`
+  (which restores your analyzed repos but, under `--rescan`, would re-list their
+  full orgs — e.g. 18 repos across apache/elastic/grafana can balloon to thousands).
 
 Diff detection is exact: the push marker is snapshotted at analysis time and
 compared for inequality, so there are no false re-queues from timestamp formatting.

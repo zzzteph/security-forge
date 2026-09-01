@@ -198,7 +198,20 @@ def main() -> None:
     ap.add_argument("--max-turns", type=int, default=500)
     ap.add_argument("--temperature", type=float, default=None)
     ap.add_argument("--max-context-tokens", type=int, default=120000)
+    ap.add_argument("--api-base", default="", help="override the model endpoint URL "
+                    "(self-hosted OpenAI-compatible server, Ollama/vLLM, or a LiteLLM "
+                    "proxy). The API key still comes from the environment "
+                    "(provider var, or SECFORGE_LLM_API_KEY for a generic endpoint).")
     a = ap.parse_args()
+
+    # Extra per-call kwargs. api_base is not secret (a flag); the key is read from
+    # the environment so it never lands in argv / a process listing.
+    extra: dict = {}
+    if a.api_base:
+        extra["api_base"] = a.api_base
+    _key = os.environ.get("SECFORGE_LLM_API_KEY", "").strip()
+    if _key:
+        extra["api_key"] = _key
 
     prompt = _load_prompt(a)
     if not prompt.strip():
@@ -215,7 +228,8 @@ def main() -> None:
         sys.exit(2)
     litellm.drop_params = True   # silently ignore params a given provider doesn't accept
 
-    emit({"type": "system", "subtype": "init", "model": a.model})
+    emit({"type": "system", "subtype": "init", "model": a.model,
+          "api_base": a.api_base or None})
     messages = [{"role": "system", "content": SYSTEM},
                 {"role": "user", "content": prompt}]
 
@@ -224,7 +238,8 @@ def main() -> None:
         try:
             resp = litellm.completion(model=a.model, messages=messages,
                                       tools=TOOLS_SCHEMA, tool_choice="auto",
-                                      temperature=a.temperature, num_retries=2)
+                                      temperature=a.temperature, num_retries=2,
+                                      **extra)
         except Exception as e:  # noqa: BLE001  (network/provider error → end cleanly)
             emit({"type": "assistant", "message": {"content": [
                 {"type": "text", "text": f"[completion error: {e}]"}]}})
