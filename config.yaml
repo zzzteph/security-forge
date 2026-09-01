@@ -6,6 +6,19 @@ target:
   branch: ""          # default branch
   depth: 1            # shallow clone: baseline static analysis doesn't need full history
 
+agent:
+  # Which AI runs each session. Default is Claude Code (unchanged behavior).
+  #   litellm  = native, no external CLI (pip install litellm); model e.g. openai/gpt-5
+  #   codex/gemini/aider = wrap that headless CLI; cli-adapter = ad-hoc (--agent-cmd)
+  # Override anything on the CLI (--backend/--model/--agent-*). See config.example.yaml.
+  backend: claude-code          # claude-code | litellm | cli-adapter | codex | gemini | aider
+  model: ""                     # e.g. openai/gpt-5 (litellm) or gpt-5 / gemini-2.5-pro (a CLI)
+  litellm: { max_turns: 500, temperature: null, max_context_tokens: 120000 }
+  backends:
+    codex:  { command: "codex exec --model {model} --dangerously-bypass-approvals-and-sandbox {prompt}", output: jsonl }
+    gemini: { command: "gemini -m {model} --yolo -p {prompt}", output: text }
+    aider:  { command: "aider --model {model} --yes --message {prompt}", output: text }
+
 analysis:
   focus:
     - authentication / authorization

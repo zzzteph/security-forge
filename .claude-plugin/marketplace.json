@@ -10,7 +10,7 @@
     {
       "name": "security-forge",
       "source": "./",
-      "version": "0.10.0",
+      "version": "0.14.0",
       "description": "Builds a durable model of a target repo, hunts real reachable vulnerabilities, verifies them by running the app in a container, and reports locally.",
       "category": "security",
       "keywords": [

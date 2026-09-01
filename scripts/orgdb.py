@@ -38,7 +38,8 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import DATA_ROOT, now_iso, sev_rank, target_slug, configure_stdio  # noqa: E402
+from common import (DATA_ROOT, KNOWLEDGE_ROOT, now_iso, sev_rank, target_slug,  # noqa: E402
+                    configure_stdio)
 
 configure_stdio()
 
@@ -265,6 +266,71 @@ def pending_count(pushed_since: str | None = None, rescan: bool = False) -> int:
     return len(next_batch(count=10_000_000, pushed_since=pushed_since, rescan=rescan))
 
 
+_GH_COM_HOSTS = {"github.com", "www.github.com", "api.github.com"}
+
+
+def _org_from_slug(slug: str) -> str | None:
+    """Durable owner key from a host/owner/repo slug: bare login on github.com,
+    host-qualified elsewhere (mirrors org.owner_key so --rescan can re-target)."""
+    parts = [p for p in slug.split("/") if p]
+    if len(parts) < 3:
+        return None
+    host, owner = parts[0], parts[1]
+    return owner if host in _GH_COM_HOSTS else f"{host}/{owner}"
+
+
+def backfill() -> dict:
+    """Rebuild the queue/ledger from the durable knowledge/ folder.
+
+    The DB (db/security-forge.db) is LOCAL and gitignored; knowledge/ (models +
+    findings) is what actually persists and travels between machines. So on a new
+    box — or after the DB is wiped — the queue is empty even though every model is
+    present, and `--rescan` finds nothing to do. This reconstructs one target row
+    per `knowledge/<host>/<owner>/<repo>/model.json`: it sets the owner (so
+    `owners()` / a bare `--rescan` see it), marks it `analyzed` at the model's
+    `last_analyzed_commit`, and folds its findings.json back in. Idempotent.
+
+    Note: `pushed_at` is unknown from local state, so a subsequent org sync fills
+    it and — because `analyzed_pushed_at` is left null here — `--rescan` re-queues
+    every backfilled repo once (a conservative re-check), then only changed ones
+    thereafter."""
+    init()
+    kroot = KNOWLEDGE_ROOT
+    if not kroot.is_dir():
+        return {"knowledge_root": str(kroot), "found": 0, "note": "no knowledge/ dir"}
+    new = updated = findings_synced = 0
+    models = sorted(kroot.glob("*/*/*/model.json"))
+    for model_path in models:
+        slug = model_path.parent.relative_to(kroot).as_posix()
+        try:
+            model = json.loads(model_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            model = {}
+        slug = (model.get("target") or slug).strip("/")
+        repo_url = (model.get("repo_url") or f"https://{slug}").strip()
+        commit = model.get("last_analyzed_commit") or model.get("built_commit")
+        parts = slug.split("/")
+        existed = get(slug) is not None
+        upsert_target({"repo_url": repo_url, "slug": slug,
+                       "org": _org_from_slug(slug),
+                       "name": "/".join(parts[1:]) if len(parts) >= 3 else slug})
+        set_status(slug, "analyzed", analyzed_commit=commit)
+        new, updated = (new, updated + 1) if existed else (new + 1, updated)
+        fpath = model_path.parent / "findings.json"
+        if fpath.exists():
+            try:
+                fdb = json.loads(fpath.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                fdb = {}
+            for f in (fdb.values() if isinstance(fdb, dict) else []):
+                if f.get("id"):
+                    sync_finding(slug, commit or f.get("last_commit"), f)
+                    findings_synced += 1
+    return {"knowledge_root": str(kroot), "found": len(models),
+            "targets": new + updated, "new": new, "updated": updated,
+            "findings_synced": findings_synced, "owners": owners()}
+
+
 def owners() -> list[str]:
     """Distinct repo owners (orgs/users) currently tracked — drives `--rescan`
     re-syncs when no explicit --org/--user is given."""
@@ -383,6 +449,7 @@ def main() -> None:
     p = sub.add_parser("set-status"); p.add_argument("--slug", required=True)
     p.add_argument("--status", required=True); p.add_argument("--error"); p.add_argument("--analyzed-commit")
     p = sub.add_parser("reap-stale"); p.add_argument("--max-attempts", type=int, default=2)
+    sub.add_parser("backfill")
     args = ap.parse_args()
 
     if args.cmd == "init":
@@ -427,6 +494,8 @@ def main() -> None:
         _print(get(args.slug))
     elif args.cmd == "reap-stale":
         _print(reap_stale(args.max_attempts))
+    elif args.cmd == "backfill":
+        _print(backfill())
 
 
 if __name__ == "__main__":

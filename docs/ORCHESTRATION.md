@@ -73,6 +73,55 @@ for verification-heavy targets, e.g. `--timeout 7200`), `--max-repos N`
 `--model <name>`, `--include-forks`, `--include-archived`, `--output-dir <path>`
 (send the db/logs/knowledge somewhere other than the repo folder), `--no-sync`.
 
+## Which AI runs each session (backends)
+
+The whole engine — scripts, Docker sandbox, the `verify-poc` advisory gate, the DB
+— is provider-neutral; a **backend** just decides which agent CLI runs a session.
+Default is **Claude Code**; you can point it at any other headless agentic CLI.
+
+- **claude-code** (default) — `claude` runs the session (unchanged).
+- **litellm** — NATIVE, no external CLI: security-forge runs its own tool-use loop
+  (`scripts/litellm_agent.py`, tools `bash`/`read_file`/`write_file`) over **LiteLLM**,
+  so any LiteLLM model works directly — `openai/gpt-5`, `gemini/gemini-2.5-pro`,
+  `anthropic/claude-3-7-sonnet`, `ollama/llama3`, a local endpoint. Needs
+  `pip install litellm`; keys come from the env / `--agent-env`.
+- **cli-adapter** — wrap any headless agentic CLI from a command TEMPLATE with
+  `{prompt}` and `{model}` placeholders (no shell; `{prompt}` stays one argument).
+- **named presets** — define your agent "types" once in `config.yaml` under
+  `agent.backends.<name>` (examples ship for `codex`, `gemini`, `aider`) and select
+  one by name.
+
+```bash
+# native LiteLLM (no external CLI) — model is a LiteLLM string:
+python orchestrate.py --org OWNER --backend litellm --model openai/gpt-5 \
+  --agent-env OPENAI_API_KEY=sk-...
+python orchestrate.py --org OWNER --backend litellm --model ollama/llama3   # local, no key
+
+# pick a preset "type" + a model:
+python orchestrate.py --org OWNER --backend codex  --model gpt-5
+python orchestrate.py --org OWNER --backend gemini --model gemini-2.5-pro
+
+# everything on the command line — no config.yaml, no .env needed.
+# --agent-cmd alone implies cli-adapter; --agent-env sets provider keys/endpoints:
+python orchestrate.py --repo <url> \
+  --agent-cmd "aider --model {model} --yes --message {prompt}" \
+  --agent-output text --model gpt-5 \
+  --agent-env OPENAI_API_KEY=sk-... --agent-env OPENAI_BASE_URL=https://my-proxy/v1
+```
+
+Everything a backend needs is specifiable inline: `--agent-cmd` (the command, with
+`{prompt}`/`{model}`), `--agent-output` (`text`|`jsonl`), `--model`, and repeatable
+`--agent-env KEY=VALUE` (provider keys, base URLs — merged into the child's
+environment, never printed). Precedence is CLI flag > `config.yaml agent:` >
+default; an explicit `--agent-cmd` implies `--backend cli-adapter`. `--model` is
+normalized for `claude-code` (`opus4.8` → `claude-opus-4-8`) and passed **verbatim**
+to every other backend. Provider keys can also come from the environment or
+security-forge's `.env` (the orchestrator loads it and passes it to the child) —
+`--agent-env` just lets you skip both. Two notes: weaker models produce more false positives — the
+`verify-poc` gate is what keeps that honest; and parallel subagents are a Claude
+Code feature, so other CLIs fall back to inline role execution (less parallel, same
+method).
+
 ## Sweep vs rescan
 
 - **Default (sweep):** analyzes repos that were never analyzed, plus any left in

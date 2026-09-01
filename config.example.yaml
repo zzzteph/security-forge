@@ -10,6 +10,46 @@ target:
   branch: ""                     # blank = default branch
   depth: null                    # null = full history (needed for secret scanning); or an int for shallow
 
+agent:
+  # WHICH AI runs each analysis session. The whole engine (scripts, sandbox,
+  # verify-poc gate, DB) is provider-neutral; only this picks the driver.
+  # Precedence for every field: CLI flag > this block > built-in default.
+  #   claude-code   Claude Code CLI (default)
+  #   litellm       NATIVE, no external CLI — our own tool loop over LiteLLM, so any
+  #                 LiteLLM model works directly (needs `pip install litellm`)
+  #   cli-adapter   wrap an ad-hoc headless agentic CLI (see cli: below)
+  #   <preset>      any name under `backends:` (codex / gemini / aider examples)
+  backend: claude-code           # claude-code | litellm | cli-adapter | <preset>
+  model: ""                      # default model; claude-code normalizes (opus4.8 -> claude-opus-4-8),
+                                 # everything else verbatim. For litellm use a LiteLLM string,
+                                 # e.g. openai/gpt-5, gemini/gemini-2.5-pro, anthropic/claude-3-7-sonnet, ollama/llama3
+
+  # Tuning for the native `litellm` backend (only used when backend: litellm).
+  litellm:
+    max_turns: 500               # max tool-use turns per session (wall clock still bounded by --timeout)
+    temperature: null            # null = provider default
+    max_context_tokens: 120000   # trim old tool output above this to stay in the model's window
+
+  # Ad-hoc wrapper for one-off use: `--backend cli-adapter` runs this template.
+  cli:
+    command: ""                  # e.g. "codex exec --model {model} --dangerously-bypass-approvals-and-sandbox {prompt}"
+    output: text                 # text (tail the log) | jsonl (parse Claude-style stream-json events)
+
+  # NAMED PRESETS — your registry of agent "types". Select one with `--backend <name>`
+  # (e.g. `--backend codex --model gpt-5`). {prompt} and {model} are substituted;
+  # {prompt} stays a single argv element (no shell), provider keys come from .env.
+  # These are EXAMPLES — adjust the exact flags to the CLI/version you have installed.
+  backends:
+    codex:                       # OpenAI Codex CLI (headless); model e.g. gpt-5, o4-mini
+      command: "codex exec --model {model} --dangerously-bypass-approvals-and-sandbox {prompt}"
+      output: jsonl
+    gemini:                      # Google Gemini CLI; model e.g. gemini-2.5-pro
+      command: "gemini -m {model} --yolo -p {prompt}"
+      output: text
+    aider:                       # aider (uses LiteLLM under the hood → 100+ providers)
+      command: "aider --model {model} --yes --message {prompt}"
+      output: text
+
 analysis:
   # How aggressive the agentic pass is. The skill reads these.
   focus:                         # optional: bias analysis toward these areas

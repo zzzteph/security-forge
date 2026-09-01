@@ -2,3 +2,9 @@
 # docker + all HTTP use the Python stdlib, so only YAML config parsing needs a
 # third-party package.
 PyYAML>=6.0
+
+# Optional: only for the native `litellm` backend (agent.backend: litellm), which
+# drives OpenAI/Gemini/Anthropic/Azure/Bedrock/local models directly with no external
+# agentic CLI. Not needed for the default claude-code backend. Install when you use it:
+#   pip install litellm
+# litellm>=1.40

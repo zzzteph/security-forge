@@ -272,16 +272,170 @@ class _Progress:
                 f"tok in {_h(self.tin)}/out {_h(self.tout)}{cost}{err}")
 
 
-def run_session(prompt: str, env_extra: dict, claude: str, model: str,
+class _TextProgress:
+    """Fallback progress reader for a backend whose log is plain text (or a JSON
+    shape we don't parse): count lines/bytes and echo the latest non-empty line.
+    Same interface as `_Progress` so the heartbeat loop is backend-agnostic."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.off = 0
+        self.buf = ""
+        self.lines = 0
+        self.nbytes = 0
+        self.last = "(starting…)"
+        self.err = None
+
+    def update(self) -> str:
+        try:
+            with open(self.path, "rb") as f:
+                f.seek(self.off)
+                data = f.read()
+                self.off = f.tell()
+        except OSError:
+            return self.status()
+        if data:
+            self.nbytes += len(data)
+            self.buf += data.decode("utf-8", "replace")
+            *lines, self.buf = self.buf.split("\n")
+            for ln in lines:
+                s = ln.strip()
+                if s:
+                    self.lines += 1
+                    self.last = s[:100]
+        return self.status()
+
+    def status(self) -> str:
+        return f"lines={self.lines} {_h(self.nbytes)}B  {self.last}"
+
+    def summary(self) -> str:
+        return f"{self.lines} lines, {_h(self.nbytes)}B"
+
+
+class AgentBackend:
+    """Pluggable 'run one headless agentic session' backend. The orchestrator (queue,
+    timeout, teardown, salvage) is backend-agnostic; a backend only knows how to
+    LAUNCH the agent and how to READ its log for the heartbeat. `claude-code` is the
+    default; `cli-adapter` wraps any other headless agentic CLI via a template."""
+
+    name = "base"
+
+    def build_command(self, prompt: str, model: str) -> list[str]:
+        raise NotImplementedError
+
+    def progress(self, log_path: Path):
+        return _TextProgress(log_path)
+
+    def normalize_model(self, model: str) -> str:
+        return model
+
+    def missing_hint(self, binary: str) -> str:
+        return f"'{binary}' not found — check the {self.name} backend command/PATH."
+
+
+class ClaudeCodeBackend(AgentBackend):
+    name = "claude-code"
+
+    def __init__(self, claude_bin: str):
+        self.claude = claude_bin
+
+    def build_command(self, prompt: str, model: str) -> list[str]:
+        cmd = [self.claude, "-p", prompt, "--verbose", "--output-format",
+               "stream-json", "--dangerously-skip-permissions"]
+        if model:
+            cmd += ["--model", model]
+        return cmd
+
+    def progress(self, log_path: Path):
+        return _Progress(log_path)          # rich stream-json parser
+
+    def normalize_model(self, model: str) -> str:
+        return normalize_model(model)       # opus4.8 -> claude-opus-4-8
+
+    def missing_hint(self, binary: str) -> str:
+        return (f"'{binary}' not found — install Claude Code or pass --claude <path>.")
+
+
+class CliAdapterBackend(AgentBackend):
+    """Drive ANY headless agentic CLI (OpenAI Codex, Gemini CLI, aider, …) from a
+    command TEMPLATE with `{prompt}` and `{model}` placeholders, e.g.:
+        codex exec --model {model} --dangerously-bypass-approvals-and-sandbox {prompt}
+        gemini -m {model} --yolo -p {prompt}
+        aider --model {model} --yes --message {prompt}
+    The template is split with shlex (so flags stay separate), then placeholders are
+    substituted token-wise — `{prompt}` is replaced whole, so the (large) prompt
+    stays ONE argv element and no shell is involved. Model passes through verbatim
+    (gpt-5, gemini-2.5-pro, …). Provider keys come from the environment / .env."""
+
+    name = "cli-adapter"
+
+    def __init__(self, template: str, output: str = "text"):
+        self.template = template
+        self.output = (output or "text").lower()
+
+    def build_command(self, prompt: str, model: str) -> list[str]:
+        import shlex
+        toks = shlex.split(self.template, posix=(os.name != "nt"))
+        if not toks:
+            raise SystemExit("[orch] cli-adapter: empty command template")
+        out, saw_prompt = [], False
+        for t in toks:
+            t = t.replace("{model}", model or "")
+            if "{prompt}" in t:
+                saw_prompt = True
+                t = t.replace("{prompt}", prompt)
+            out.append(t)
+        if not saw_prompt:                  # template omitted {prompt}: append it
+            out.append(prompt)
+        return out
+
+    def progress(self, log_path: Path):
+        # 'jsonl'/'stream-json' → the same event shape Claude Code emits; else text.
+        if self.output in ("jsonl", "stream-json", "claude"):
+            return _Progress(log_path)
+        return _TextProgress(log_path)
+
+
+class LiteLLMBackend(AgentBackend):
+    """Native, CLI-free backend: runs `scripts/litellm_agent.py` (our own tool-use
+    loop over LiteLLM) as the session subprocess. Works with any LiteLLM model
+    string — openai/gpt-5, gemini/gemini-2.5-pro, anthropic/…, ollama/…, a local
+    endpoint — with provider keys from the env / --agent-env. Emits Claude-style
+    stream-json, so the heartbeat and salvage work exactly as for claude-code."""
+
+    name = "litellm"
+
+    def __init__(self, max_turns=None, temperature=None, max_context_tokens=None):
+        self.script = ROOT / "scripts" / "litellm_agent.py"
+        self.max_turns = max_turns
+        self.temperature = temperature
+        self.max_context_tokens = max_context_tokens
+
+    def build_command(self, prompt: str, model: str) -> list[str]:
+        cmd = [PY, str(self.script), "--model", model or "", "--prompt", prompt]
+        if self.max_turns:
+            cmd += ["--max-turns", str(self.max_turns)]
+        if self.temperature is not None:
+            cmd += ["--temperature", str(self.temperature)]
+        if self.max_context_tokens:
+            cmd += ["--max-context-tokens", str(self.max_context_tokens)]
+        return cmd
+
+    def progress(self, log_path: Path):
+        return _Progress(log_path)          # emits Claude-style events
+
+    def missing_hint(self, binary: str) -> str:
+        return (f"python ('{binary}') not found for the litellm backend — it runs "
+                f"scripts/litellm_agent.py (needs `pip install litellm`).")
+
+
+def run_session(prompt: str, env_extra: dict, backend: AgentBackend, model: str,
                 timeout: int, log_path: Path, heartbeat: int = 30,
                 quiet: bool = False) -> int:
-    """Launch one headless Claude session, bounded by a hard timeout. Prints a
-    heartbeat every `heartbeat`s. Returns the exit code, or 124 if killed at the
-    deadline. Never raises (except a missing `claude` binary)."""
-    cmd = [claude, "-p", prompt, "--verbose", "--output-format", "stream-json",
-           "--dangerously-skip-permissions"]
-    if model:
-        cmd += ["--model", model]
+    """Launch one headless agent session (via `backend`), bounded by a hard timeout.
+    Prints a heartbeat every `heartbeat`s. Returns the exit code, or 124 if killed
+    at the deadline. Never raises (except a missing agent binary)."""
+    cmd = backend.build_command(prompt, model)
     env = {**os.environ, **env_extra}
     popen_kw = {}
     if os.name == "posix":
@@ -294,11 +448,10 @@ def run_session(prompt: str, env_extra: dict, claude: str, model: str,
                              stderr=subprocess.STDOUT, env=env, **popen_kw)
     except FileNotFoundError:
         log.close()
-        print(f"[orch] FATAL: '{claude}' not found — install Claude Code or pass "
-              f"--claude <path>.", file=sys.stderr)
+        print(f"[orch] FATAL: {backend.missing_hint(cmd[0])}", file=sys.stderr)
         raise SystemExit(2)
     start = time.monotonic()
-    prog = _Progress(log_path)
+    prog = backend.progress(log_path)
     rc = None
     try:
         while True:
@@ -326,6 +479,92 @@ def data_root() -> Path:
     return Path(os.environ.get("SECFORGE_DATA_DIR") or ROOT).expanduser().resolve()
 
 
+def load_dotenv() -> None:
+    """Load ROOT/.env into the environment (without overriding real env vars) so a
+    non-Claude backend's provider keys (OPENAI_API_KEY, GEMINI_API_KEY, …) reach the
+    child CLI even when they live in security-forge's .env rather than the shell."""
+    p = ROOT / ".env"
+    if not p.exists():
+        return
+    try:
+        for line in p.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+    except OSError:
+        pass
+
+
+def agent_config() -> dict:
+    """The optional `agent:` block from config.yaml (backend/model/cli). Tolerant:
+    returns {} if the file or PyYAML is missing, so the orchestrator never hard-
+    depends on config just to launch the default Claude backend."""
+    try:
+        import yaml  # type: ignore
+        p = ROOT / "config.yaml"
+        if p.exists():
+            return (yaml.safe_load(p.read_text(encoding="utf-8")) or {}).get("agent") or {}
+    except Exception:  # noqa: BLE001  (missing yaml / malformed file → no agent cfg)
+        pass
+    return {}
+
+
+def resolve_backend(args, cfg: dict) -> AgentBackend:
+    """Pick the backend to run every session. Precedence: CLI flag > config.agent >
+    default 'claude-code'. Beyond the two built-ins, `name` may select a NAMED
+    PRESET from `config.yaml agent.backends.<name>` — your registry of agent
+    'types' (codex / gemini / aider / a local model via LiteLLM-backed CLI, …),
+    each a command template + output format. `--model` fills the template's
+    `{model}`, so `--backend codex --model gpt-5` just works."""
+    # Precedence: explicit --backend wins; else a CLI --agent-cmd implies the ad-hoc
+    # cli-adapter (a command line signal beats the config default, so you can specify
+    # a whole backend inline without touching config.yaml); else config; else default.
+    if args.backend:
+        name = args.backend.strip()
+    elif args.agent_cmd:
+        name = "cli-adapter"
+    else:
+        name = (cfg.get("backend") or "claude-code").strip()
+    presets = cfg.get("backends") or {}
+
+    if name == "claude-code":
+        return ClaudeCodeBackend(args.claude)
+
+    if name == "litellm":
+        lc = cfg.get("litellm") or {}
+        mt = args.agent_max_turns or lc.get("max_turns")
+        temp = (args.agent_temperature if args.agent_temperature is not None
+                else lc.get("temperature"))
+        mct = lc.get("max_context_tokens")
+        return LiteLLMBackend(mt, temp, mct)
+
+    if name == "cli-adapter":
+        cli = cfg.get("cli") or {}
+        template = (args.agent_cmd or cli.get("command") or "").strip()
+        output = (args.agent_output or cli.get("output") or "text").strip()
+    elif name in presets:                       # a named 'type' from the registry
+        preset = presets[name] or {}
+        template = (args.agent_cmd or preset.get("command") or "").strip()
+        output = (args.agent_output or preset.get("output") or "text").strip()
+    else:
+        known = ", ".join(["claude-code", "cli-adapter", *sorted(presets)])
+        print(f"[orch] FATAL: unknown --backend '{name}' (available: {known})",
+              file=sys.stderr)
+        raise SystemExit(2)
+
+    if not template:
+        print(f"[orch] FATAL: backend '{name}' needs a command template — pass "
+              f"--agent-cmd '<cmd with {{prompt}} {{model}}>' or set it in "
+              f"config.yaml (agent.cli.command or agent.backends.{name}.command).",
+              file=sys.stderr)
+        raise SystemExit(2)
+    b = CliAdapterBackend(template, output)
+    b.name = name                               # report the chosen type in logs
+    return b
+
+
 def process_repo(t: dict, args, logs: Path, idx: int, total) -> str:
     """Run one bounded session for a single repo, tear down, and return its final
     DB status. Shared by the org-drain loop and the single --repo path."""
@@ -336,12 +575,13 @@ def process_repo(t: dict, args, logs: Path, idx: int, total) -> str:
     env_extra = {"SECFORGE_TARGET_REPO": repo_url, "SECFORGE_TARGET": slug}
     if os.environ.get("SECFORGE_DATA_DIR"):
         env_extra["SECFORGE_DATA_DIR"] = os.environ["SECFORGE_DATA_DIR"]
+    env_extra.update(getattr(args, "_agent_env", {}))   # provider keys from --agent-env
     orgdb("set-status", "--slug", slug, "--status", "analyzing")
     print(f"[orch] ({idx}/{total}) {slug} → session (≤{args.timeout}s)  log: {log}",
           flush=True)
     t0 = time.monotonic()
     rc = run_session(build_prompt(repo_url, slug, args.timeout), env_extra,
-                     args.claude, args.model, args.timeout, log, args.heartbeat,
+                     args._backend, args.model, args.timeout, log, args.heartbeat,
                      args.silent)
     cleanup(slug, env_extra)
     orgdb("reap-stale", "--max-attempts", str(args.max_attempts))
@@ -429,8 +669,36 @@ def main():
     ap.add_argument("--max-attempts", type=int, default=2,
                     help="skip a repo after this many aborted sessions across runs")
     ap.add_argument("--claude", default=os.environ.get("CLAUDE_BIN", "claude"),
-                    help="path to the Claude Code CLI (default: claude)")
-    ap.add_argument("--model", default="", help="optional --model to pass through")
+                    help="path to the Claude Code CLI (default: claude); used by "
+                         "the claude-code backend")
+    ap.add_argument("--backend", default="",
+                    help="which agent runs each session: 'claude-code' (default) or "
+                         "'cli-adapter' to wrap any headless agentic CLI (OpenAI "
+                         "Codex, Gemini CLI, aider, …). Overrides config.yaml "
+                         "agent.backend.")
+    ap.add_argument("--agent-cmd", default="",
+                    help="cli-adapter: command TEMPLATE with {prompt} and {model} "
+                         "placeholders, e.g. \"codex exec --model {model} "
+                         "--dangerously-bypass-approvals-and-sandbox {prompt}\". "
+                         "Overrides config.yaml agent.cli.command.")
+    ap.add_argument("--agent-output", default="",
+                    help="cli-adapter: 'text' (default) or 'jsonl' — how to read the "
+                         "wrapped CLI's log for the progress heartbeat.")
+    ap.add_argument("--agent-env", action="append", default=[], metavar="KEY=VALUE",
+                    help="set an environment variable for the agent CLI (repeatable), "
+                         "e.g. --agent-env OPENAI_API_KEY=sk-... --agent-env "
+                         "OPENAI_BASE_URL=https://... . Lets you specify provider "
+                         "keys/endpoints entirely on the command line instead of "
+                         ".env; these override the inherited environment. Values are "
+                         "never printed to the console.")
+    ap.add_argument("--agent-max-turns", type=int, default=0,
+                    help="litellm backend: max tool-use turns per session (0 = "
+                         "default 500). The per-repo --timeout still bounds wall clock.")
+    ap.add_argument("--agent-temperature", type=float, default=None,
+                    help="litellm backend: sampling temperature (provider default if unset)")
+    ap.add_argument("--model", default="", help="optional model to pass through "
+                    "(claude-code: normalized, e.g. opus4.8 -> claude-opus-4-8; "
+                    "cli-adapter: passed verbatim, e.g. gpt-5, gemini-2.5-pro)")
     ap.add_argument("--heartbeat", type=int, default=30,
                     help="seconds between progress heartbeats (default: 30)")
     ap.add_argument("--silent", action="store_true",
@@ -452,11 +720,36 @@ def main():
                     help="print the plan and launch nothing")
     args = ap.parse_args()
 
+    # Backend + model: resolve the agent BEFORE the model, since model normalization
+    # is backend-specific (claude-code maps opus4.8 -> claude-opus-4-8; others pass
+    # it through verbatim). Provider keys for non-Claude backends may live in .env.
+    load_dotenv()
+    acfg = agent_config()
+    # Extra env for the agent CLI, straight from the command line (provider keys,
+    # base URLs). Parsed once; merged into every session's environment. Never logged.
+    args._agent_env = {}
+    for kv in args.agent_env:
+        if "=" not in kv:
+            print(f"[orch] WARNING: ignoring --agent-env '{kv}' (need KEY=VALUE)",
+                  file=sys.stderr)
+            continue
+        k, v = kv.split("=", 1)
+        args._agent_env[k.strip()] = v
+    args._backend = resolve_backend(args, acfg)
+    if not args.model:
+        args.model = (acfg.get("model") or "").strip()
     if args.model:
-        norm = normalize_model(args.model)
+        norm = args._backend.normalize_model(args.model)
         if norm != args.model:
             print(f"[orch] model '{args.model}' -> '{norm}'", flush=True)
         args.model = norm
+    if args._backend.name == "litellm" and not args.model:
+        print("[orch] FATAL: the litellm backend needs a model — pass --model "
+              "<litellm model> (e.g. openai/gpt-5, gemini/gemini-2.5-pro, "
+              "ollama/llama3) or set config.yaml agent.model.", file=sys.stderr)
+        raise SystemExit(2)
+    print(f"[orch] backend={args._backend.name}"
+          f"{' model=' + args.model if args.model else ''}", flush=True)
 
     # Redirect all artifacts before anything touches the DB; children inherit it.
     if args.output_dir:
@@ -510,8 +803,24 @@ def main():
                   f"filtered_out={s.get('filtered_out','?')} "
                   f"(archived={s.get('skipped_archived',0)} forks={s.get('skipped_forks',0)})")
         elif args.rescan and not args.no_sync:
-            # rescan without an explicit owner: refresh every owner we already track
-            for owner in (orgdb("owners") or {}).get("owners", []):
+            # rescan without an explicit owner: refresh every owner we already track.
+            owners = (orgdb("owners") or {}).get("owners", [])
+            if not owners:
+                # The DB is local/gitignored; knowledge/ is the durable state. On a
+                # fresh box (or after a DB wipe) the queue is empty while every model
+                # is still on disk — rebuild the queue from knowledge/ so a bare
+                # --rescan actually has something to re-check.
+                bf = orgdb("backfill") or {}
+                if bf.get("targets"):
+                    print(f"[orch] queue was empty — backfilled {bf['targets']} target(s) "
+                          f"from local knowledge/ ({bf.get('findings_synced', 0)} findings, "
+                          f"{bf.get('found', 0)} models).", flush=True)
+                    owners = bf.get("owners") or (orgdb("owners") or {}).get("owners", [])
+            if not owners:
+                print("[orch] --rescan: no owners tracked and no local models to "
+                      "backfill — run `--org OWNER` (or `--user NAME`) once to "
+                      "populate the queue.", flush=True)
+            for owner in owners:
                 s = org("sync", "--org", owner, *extra) or {}
                 print(f"[orch] re-synced {owner}: listed={s.get('listed','?')} "
                       f"queued={s.get('queued','?')}")

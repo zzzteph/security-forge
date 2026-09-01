@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "security-forge",
   "description": "Agentic security / bug-bounty audit pipeline: builds a durable model of a target repo, hunts real reachable vulnerabilities, verifies them by running the app in a container, and reports locally (never blocks or touches PRs).",
-  "version": "0.10.0",
+  "version": "0.14.0",
   "author": {
     "name": "zzzteph",
     "url": "https://github.com/zzzteph"
