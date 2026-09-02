@@ -119,6 +119,7 @@ def next_targets(count: int, rescan: bool = False, known_only: bool = False) -> 
 
 
 def build_prompt(repo_url: str, slug: str, timeout: int, verify: bool = False) -> str:
+    unlimited = timeout <= 0
     mins = max(1, timeout // 60)
     reserve = 3 if mins <= 45 else 5
     if verify:
@@ -135,6 +136,58 @@ def build_prompt(repo_url: str, slug: str, timeout: int, verify: bool = False) -
                 "+ a PoC SKETCH, then run ")
         tail = (f"`python scripts/org.py record --repo {repo_url}` to fold the "
                 f"findings into the DB and mark it analyzed. (No nuke — no sandbox.) ")
+
+    if unlimited:
+        budget = ("IMPORTANT — there is NO time limit on this session: be THOROUGH and "
+                  "take as long as you need; never skip a step (especially verification) "
+                  "to save time. Still work as follows: ")
+    else:
+        budget = (f"CRITICAL — HARD DEADLINE: this session is force-killed at ~{mins} "
+                  f"minutes of wall-clock; whatever is not written to the store by then "
+                  f"is LOST. Plan the whole cycle around that budget: ")
+    if verify and unlimited:
+        item4 = (f"(4) FINISH — only once EVERY HIGH/CRITICAL has a reproduced PoC "
+                 f"bundle AND an advisory: run `python scripts/org.py record --repo "
+                 f"{repo_url}`, then `python scripts/pipeline.py gc-advisories --apply` "
+                 f"(drops any advisory not backed by a reproduced bundle), then `python "
+                 f"scripts/verify.py nuke`. Your turn MUST NOT end until all three run.")
+    elif verify:
+        item4 = (f"(4) LAND THE PLANE — run `python scripts/org.py record --repo "
+                 f"{repo_url}`, then `python scripts/pipeline.py gc-advisories --apply`, "
+                 f"then `python scripts/verify.py nuke`. Every verified HIGH/CRITICAL "
+                 f"must have BOTH an advisory and a PoC bundle. If short on time, finish "
+                 f"the ones you verified. Your turn MUST NOT end until all three run.")
+    elif unlimited:
+        item4 = (f"(4) FINISH — when analysis is complete, run `python scripts/org.py "
+                 f"record --repo {repo_url}`. Your turn MUST NOT end until record has run. "
+                 f"(No nuke — no sandbox.)")
+    else:
+        item4 = (f"(4) LAND THE PLANE — keep the last ~{reserve} minutes to run `python "
+                 f"scripts/org.py record --repo {repo_url}`. If short on time, record what "
+                 f"you have. Your turn MUST NOT end until record has run. (No nuke — no sandbox.)")
+    if verify:
+        verify_block = (
+            "(3b) VERIFY + FULL DELIVERABLES for EVERY HIGH/CRITICAL — MANDATORY THIS "
+            "RUN, for THIS repo only. For each HIGH and CRITICAL finding you record, "
+            "produce ALL THREE, never one without the others: "
+            "(a) a self-contained runnable PoC BUNDLE in <knowledge_dir>/poc/<NN>-<slug>/ "
+            "— a docker-compose.yml that boots the vulnerable target, a poc.py that "
+            "fires the exploit and prints `EXPLOITED ✓` / exits 0 on success (non-zero "
+            "on failure), plus a short README; "
+            "(b) run `python scripts/pipeline.py verify-poc <id> --dir <bundle>` and "
+            "confirm it exits 0 — this is what flips the finding to `verified`; a "
+            "bundle that does not reproduce means it is NOT verified (fix it or drop "
+            "the finding); "
+            "(c) a GHSA-style ADVISORY at <knowledge_dir>/advisories/GHSA-<NN>-<slug>.md "
+            "(summary, affected version, root cause with file:line, PoC, impact, "
+            "remediation, CVSS), linked with `python scripts/pipeline.py set-status "
+            "<id> --advisory-path <file>`. "
+            "So every verified HIGH/CRITICAL ends with a reproduced Docker PoC bundle AND "
+            "an advisory. Do NOT skip any of this to save time, and do NOT verify or "
+            "write deliverables for any other repo. MEDIUM findings stay static — no "
+            "bundle, no advisory. ")
+    else:
+        verify_block = ""
     return (
         f"You are analyzing EXACTLY ONE repository: {repo_url} (slug {slug}). "
         f"SECFORGE_TARGET_REPO is already set to it in your environment, so every "
@@ -148,9 +201,7 @@ def build_prompt(repo_url: str, slug: str, timeout: int, verify: bool = False) -
         f"Do NOT analyze any other repo, do NOT loop to a next repo, never "
         f"ask questions, keep everything local (notify-only). Stop as soon as this "
         f"one repo is recorded. "
-        f"CRITICAL — HARD DEADLINE: this session is force-killed at ~{mins} minutes "
-        f"of wall-clock; whatever is not written to the store by then is LOST. Plan "
-        f"the whole cycle around that budget: "
+        + budget +
         f"(1) RUN SYNCHRONOUSLY in THIS turn — never call ScheduleWakeup, never "
         f"defer work to a background agent and end your turn waiting for it to "
         f"report back; if you delegate to a subagent, wait for it to finish and "
@@ -163,14 +214,7 @@ def build_prompt(repo_url: str, slug: str, timeout: int, verify: bool = False) -
         f"config budget and cover the highest-value areas (authz/IDOR, injection, "
         f"secrets) first. Partial coverage recorded is FINE: the next incremental "
         f"run resumes from the persisted knowledge/ model. "
-        + (f"(4) LAND THE PLANE — keep the last ~{reserve} minutes to run BOTH "
-           f"`python scripts/org.py record --repo {repo_url}` AND `python "
-           f"scripts/verify.py nuke`. If short on time, record what you have, then "
-           f"record + nuke. Your turn MUST NOT end until BOTH record AND nuke have run."
-           if verify else
-           f"(4) LAND THE PLANE — keep the last ~{reserve} minutes to run `python "
-           f"scripts/org.py record --repo {repo_url}`. If short on time, record what "
-           f"you have. Your turn MUST NOT end until record has run. (No nuke — no sandbox.)")
+        + verify_block + item4
     )
 
 
@@ -487,13 +531,19 @@ def run_session(prompt: str, env_extra: dict, backend: AgentBackend, model: str,
     rc = None
     try:
         while True:
-            remaining = timeout - (time.monotonic() - start)
-            if remaining <= 0:
-                _kill_tree(p)
-                rc = 124
-                break
+            # timeout <= 0 means NO hard limit: wait one heartbeat at a time and
+            # never kill — the session runs until it finishes on its own.
+            if timeout > 0:
+                remaining = timeout - (time.monotonic() - start)
+                if remaining <= 0:
+                    _kill_tree(p)
+                    rc = 124
+                    break
+                wait_for = min(heartbeat, remaining)
+            else:
+                wait_for = heartbeat
             try:
-                rc = p.wait(timeout=min(heartbeat, remaining))
+                rc = p.wait(timeout=wait_for)
                 break
             except subprocess.TimeoutExpired:
                 el = int(time.monotonic() - start)
@@ -645,7 +695,8 @@ def process_repo(t: dict, args, logs: Path, idx: int, total) -> str:
         print(f"[orch]   ✗ prep failed: {detail} — skipped (no agent session spent)")
         return "error"
     orgdb("set-status", "--slug", slug, "--status", "analyzing")
-    print(f"[orch]   ✓ prepped @ {detail} → agent session (≤{args.timeout}s)  log: {log}",
+    _tlabel = "no limit" if args.timeout <= 0 else f"≤{args.timeout}s"
+    print(f"[orch]   ✓ prepped @ {detail} → agent session ({_tlabel})  log: {log}",
           flush=True)
     t0 = time.monotonic()
     rc = run_session(build_prompt(repo_url, slug, args.timeout,
@@ -745,13 +796,12 @@ def main():
                    "plain folder is copied. Keyed as local/<foldername>.")
     ap.add_argument("--include-forks", action="store_true")
     ap.add_argument("--include-archived", action="store_true")
-    ap.add_argument("--timeout", type=int, default=3600,
-                    help="hard per-repo session timeout, seconds (default: 3600 = "
-                         "1h). Verification-heavy targets (large Docker base images, "
-                         "big repos) may need more — raise it, e.g. --timeout 7200 "
-                         "for 2h. The per-repo session is told its budget and plans "
-                         "around it (breadth-first, checkpoint findings, land record "
-                         "+ nuke before the deadline).")
+    ap.add_argument("--timeout", type=int, default=None,
+                    help="hard per-repo session timeout, seconds. 0 = NO limit (run "
+                         "until the session finishes on its own). Default: 3600 (1h) "
+                         "for a normal run, but UNLIMITED when --verify is set (so "
+                         "Docker verification is never cut off). Set an explicit value "
+                         "to cap it, e.g. --timeout 7200.")
     ap.add_argument("--max-repos", type=int, default=0,
                     help="stop after N repos this run (0 = until the queue is empty)")
     ap.add_argument("--max-attempts", type=int, default=2,
@@ -828,6 +878,15 @@ def main():
     ap.add_argument("--dry-run", action="store_true",
                     help="print the plan and launch nothing")
     args = ap.parse_args()
+
+    # Timeout default: unlimited when --verify (verification must not be cut off),
+    # else 1h. An explicit --timeout (including 0 = unlimited) always wins.
+    if args.timeout is None:
+        args.timeout = 0 if args.verify else 3600
+    if args.verify:
+        tlabel = "unlimited" if args.timeout <= 0 else f"{args.timeout}s"
+        print(f"[orch] --verify ON: verifying HIGH/CRITICAL in the Docker sandbox; "
+              f"per-repo timeout {tlabel}.", flush=True)
 
     # Backend + model: resolve the agent BEFORE the model, since model normalization
     # is backend-specific (claude-code maps opus4.8 -> claude-opus-4-8; others pass
@@ -954,7 +1013,8 @@ def main():
     total = pending_count(rescan=args.rescan, known_only=args.known_only)
     mode = ("known-only (re-check analyzed)" if args.known_only
             else "rescan (new + changed)" if args.rescan else "sweep (new only)")
-    print(f"[orch] mode={mode} pending={total} timeout={args.timeout}s"
+    print(f"[orch] mode={mode} pending={total} "
+          f"timeout={'unlimited' if args.timeout <= 0 else str(args.timeout) + 's'}"
           f"{' (DRY-RUN)' if args.dry_run else ''}")
     if not args.dry_run:
         print(f"[orch] heartbeat every {args.heartbeat}s; watch a session live with:  "
