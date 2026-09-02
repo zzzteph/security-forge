@@ -379,6 +379,12 @@ def sync_finding(slug: str, commit_sha: str | None, f: dict) -> None:
             "last_seen": now_iso(),
             "updated": now_iso(),
         }
+        # SQLite binds only str/bytes/int/float/None; a dict/list field (e.g. an
+        # agent that set `poc` to an object) would otherwise abort the whole record
+        # step and lose every finding. JSON-encode any non-scalar so record is robust.
+        for _k, _v in list(vals.items()):
+            if not isinstance(_v, (str, bytes, int, float, type(None))):
+                vals[_k] = json.dumps(_v, ensure_ascii=False, default=str)
         if exists:
             sets = ", ".join(f"{k}=?" for k in vals)
             c.execute(f"UPDATE findings SET {sets} WHERE id=?", (*vals.values(), fid))

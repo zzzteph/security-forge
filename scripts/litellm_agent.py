@@ -48,7 +48,11 @@ SYSTEM = (
     "final summary and STOP. You have no subagents: do each analysis role's work "
     "inline yourself. Prefer the provided scripts/ helpers (python scripts/pipeline.py, "
     "verify.py, org.py) over ad-hoc commands. Never ask the user questions — if "
-    "something is ambiguous, make a reasonable choice, note it, and continue."
+    "something is ambiguous, make a reasonable choice, note it, and continue. "
+    "When you record a finding (add-finding), NEVER a one-liner: always include "
+    "description, impact (what an attacker concretely gains), root_cause (the exact "
+    "code/config that is wrong and WHY), remediation (the specific fix), and "
+    "reachability (entry point -> how untrusted input reaches the sink)."
 )
 
 # --- tool schemas (OpenAI function-calling format; LiteLLM normalizes per provider) --
@@ -56,8 +60,10 @@ TOOLS_SCHEMA = [
     {"type": "function", "function": {
         "name": "bash",
         "description": ("Run a shell command in the security-forge working directory "
-                        "and return combined stdout+stderr and the exit code. Use it "
-                        "for git, ripgrep, `python scripts/...`, docker, etc."),
+                        "and return combined stdout+stderr and the exit code. The "
+                        "shell (bash vs native Windows cmd.exe) and available tools "
+                        "are stated in the EXECUTION ENVIRONMENT note in the system "
+                        "prompt — follow it (e.g. no bash heredocs in native mode)."),
         "parameters": {"type": "object", "properties": {
             "command": {"type": "string", "description": "the shell command to run"},
             "timeout": {"type": "integer", "description": "max seconds (default 1200)"},
@@ -100,14 +106,92 @@ def _resolve(path: str) -> Path:
     return p if p.is_absolute() else (ROOT / p)
 
 
+def _git_bash() -> str | None:
+    """Locate GIT BASH (bundled with Git for Windows: git+grep+coreutils+POSIX),
+    derived from the git install so we never pick WSL bash — often first on PATH but
+    with NO git (causes clone 'No such file or directory: git')."""
+    import shutil
+    cands: list[Path] = []
+    gitexe = shutil.which("git")
+    if gitexe:
+        base = Path(gitexe).resolve().parent.parent
+        cands += [base / "bin" / "bash.exe", base / "usr" / "bin" / "bash.exe"]
+    cands += [Path(r"C:\Program Files\Git\bin\bash.exe"),
+              Path(r"C:\Program Files\Git\usr\bin\bash.exe"),
+              Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Git" / "bin" / "bash.exe"]
+    for c in cands:
+        try:
+            if c.is_file():
+                return str(c)
+        except Exception:  # noqa: BLE001
+            pass
+    return None
+
+
+_PROBE_TOOLS = ["git", "python", "grep", "rg", "curl", "tar", "sed", "awk",
+                "docker", "podman", "findstr", "powershell"]
+
+
+def _detect_caps() -> dict:
+    """Pick a shell that can run the pipeline (clones with git): Git Bash
+    (git+grep+POSIX) -> native cmd (if native git) -> other bash. Never a bash
+    lacking git."""
+    import shutil
+    import platform as _plat
+    native = {t: shutil.which(t) for t in _PROBE_TOOLS}
+    native["python"] = native["python"] or sys.executable
+    gitbash = _git_bash()
+    other_bash = shutil.which("bash")
+    if gitbash:
+        mode, shell_exe = "bash", gitbash
+    elif native.get("git"):
+        mode, shell_exe = "native", None
+    elif other_bash:
+        mode, shell_exe = "bash", other_bash
+    else:
+        mode, shell_exe = "native", None
+    return {"os": _plat.system(), "mode": mode, "shell_exe": shell_exe,
+            "gitbash": gitbash, "native": {k: bool(v) for k, v in native.items()}}
+
+
+_CAPS = _detect_caps()
+
+
+def capability_report() -> str:
+    n = _CAPS["native"]
+    avail = " ".join(f"{t}={'y' if n.get(t) else 'n'}" for t in _PROBE_TOOLS)
+    return (f"[litellm-agent] env: os={_CAPS['os']} shell-mode={_CAPS['mode']} "
+            f"bash={'y' if _CAPS['shell_exe'] else 'n'} | native: {avail}")
+
+
+def capability_note() -> str:
+    n = _CAPS["native"]
+    have = ", ".join(t for t in _PROBE_TOOLS if n.get(t)) or "(minimal)"
+    miss = ", ".join(t for t in _PROBE_TOOLS if not n.get(t)) or "none"
+    if _CAPS["mode"] == "bash":
+        shell = ("Your `bash` tool runs in BASH (POSIX): pipes, heredocs, &&, "
+                 "grep -rn all work. Prefer grep -rn; rg may be absent. Forward-slash paths.")
+    else:
+        shell = ("Your `bash` tool runs in NATIVE Windows cmd.exe: NO heredocs; use "
+                 "`findstr /s /n` to search, `python -c \"...\"` or write_file (never "
+                 "`<<`), PowerShell via `powershell -Command`.")
+    return (f"EXECUTION ENVIRONMENT: os={_CAPS['os']}, shell-mode={_CAPS['mode']}. "
+            f"{shell} Tools native: {have}. Missing native: {miss}.")
+
+
 def tool_bash(args: dict) -> str:
     cmd = args.get("command", "")
     if not cmd.strip():
         return "[error: empty command]"
     to = max(1, min(int(args.get("timeout") or 1200), 3300))
+    if _CAPS["mode"] == "bash" and _CAPS.get("shell_exe"):
+        argv, shell = [_CAPS["shell_exe"], "-c", cmd], False
+    else:
+        argv, shell = cmd, True
     try:
-        p = subprocess.run(cmd, shell=True, cwd=str(ROOT), capture_output=True,
-                           text=True, encoding="utf-8", errors="replace", timeout=to)
+        p = subprocess.run(argv, shell=shell, cwd=str(ROOT), capture_output=True,
+                           text=True, encoding="utf-8", errors="replace", timeout=to,
+                           stdin=subprocess.DEVNULL)
         out = p.stdout or ""
         if p.stderr:
             out += ("\n[stderr]\n" + p.stderr)
@@ -202,7 +286,16 @@ def main() -> None:
                     "(self-hosted OpenAI-compatible server, Ollama/vLLM, or a LiteLLM "
                     "proxy). The API key still comes from the environment "
                     "(provider var, or SECFORGE_LLM_API_KEY for a generic endpoint).")
+    ap.add_argument("--reasoning-effort", default="none",
+                    help="reasoning_effort per completion (default 'none'; adapts if "
+                         "a model rejects it). '' to omit.")
     a = ap.parse_args()
+
+    # Through an OpenAI-compatible gateway (--api-base), EVERY model must go via
+    # litellm's `openai/` provider (gateway group name follows). Without it a
+    # `bedrock/…` group name makes litellm call AWS directly ('NoneType ... access_key').
+    if a.api_base and a.model and not a.model.startswith("openai/"):
+        a.model = "openai/" + a.model
 
     # Extra per-call kwargs. api_base is not secret (a flag); the key is read from
     # the environment so it never lands in argv / a process listing.
@@ -212,6 +305,7 @@ def main() -> None:
     _key = os.environ.get("SECFORGE_LLM_API_KEY", "").strip()
     if _key:
         extra["api_key"] = _key
+    re_effort = (a.reasoning_effort or "").strip()
 
     prompt = _load_prompt(a)
     if not prompt.strip():
@@ -230,27 +324,70 @@ def main() -> None:
 
     emit({"type": "system", "subtype": "init", "model": a.model,
           "api_base": a.api_base or None})
-    messages = [{"role": "system", "content": SYSTEM},
+    print(capability_report(), file=sys.stderr, flush=True)
+    emit({"type": "system", "subtype": "capabilities", "mode": _CAPS["mode"],
+          "os": _CAPS["os"], "bash": bool(_CAPS["shell_exe"]), "native": _CAPS["native"]})
+    messages = [{"role": "system", "content": SYSTEM + "\n\n" + capability_note()},
                 {"role": "user", "content": prompt}]
+
+    total_cost = 0.0
+    tin_total = tout_total = 0
+
+    def _finish(subtype: str, **extra_fields) -> None:
+        emit({"type": "result", "subtype": subtype,
+              "total_cost_usd": round(total_cost, 6),
+              "usage": {"input_tokens": tin_total, "output_tokens": tout_total},
+              **extra_fields})
+
+    def _completion(msgs: list):
+        """Adapt reasoning_effort to the model (some need 'none' for tools, others
+        reject 'none' and want 'minimal'); cache the winner."""
+        nonlocal re_effort
+        for _try in range(4):
+            kw = dict(extra)
+            if re_effort:
+                kw["reasoning_effort"] = re_effort
+            try:
+                return litellm.completion(model=a.model, messages=msgs,
+                                          tools=TOOLS_SCHEMA, tool_choice="auto",
+                                          temperature=a.temperature, num_retries=2, **kw)
+            except Exception as e:  # noqa: BLE001
+                low = str(e).lower()
+                if "reasoning_effort" not in low:
+                    raise
+                if "does not support 'none'" in low or ("supported values" in low and re_effort == "none"):
+                    re_effort = "minimal"
+                elif "set reasoning_effort to 'none'" in low or "are not supported" in low:
+                    re_effort = "none"
+                elif re_effort:
+                    re_effort = ""
+                else:
+                    raise
+        return litellm.completion(model=a.model, messages=msgs, tools=TOOLS_SCHEMA,
+                                  tool_choice="auto", temperature=a.temperature,
+                                  num_retries=2, **extra)
 
     for _turn in range(max(1, a.max_turns)):
         messages = _compact(messages, a.max_context_tokens)
         try:
-            resp = litellm.completion(model=a.model, messages=messages,
-                                      tools=TOOLS_SCHEMA, tool_choice="auto",
-                                      temperature=a.temperature, num_retries=2,
-                                      **extra)
+            resp = _completion(messages)
         except Exception as e:  # noqa: BLE001  (network/provider error → end cleanly)
             emit({"type": "assistant", "message": {"content": [
                 {"type": "text", "text": f"[completion error: {e}]"}]}})
-            emit({"type": "result", "subtype": "error_during_execution",
-                  "error": str(e)[:500]})
+            _finish("error_during_execution", error=str(e)[:500])
             print(f"[litellm-agent] completion failed: {e}", file=sys.stderr)
             sys.exit(1)
 
         msg = resp.choices[0].message
         usage = getattr(resp, "usage", None)
         tool_calls = list(getattr(msg, "tool_calls", None) or [])
+
+        tin_total += int(getattr(usage, "prompt_tokens", 0) or 0)
+        tout_total += int(getattr(usage, "completion_tokens", 0) or 0)
+        try:
+            total_cost += litellm.completion_cost(completion_response=resp) or 0.0
+        except Exception:  # noqa: BLE001
+            total_cost += float((getattr(resp, "_hidden_params", {}) or {}).get("response_cost") or 0.0)
 
         # progress event (Claude schema) so the heartbeat shows turns/tools/tokens
         blocks: list = []
@@ -279,7 +416,7 @@ def main() -> None:
         messages.append(am)
 
         if not tool_calls:                    # model produced a final answer → done
-            emit({"type": "result", "subtype": "success"})
+            _finish("success")
             return
 
         for tc in tool_calls:                 # run each tool, feed results back
@@ -292,9 +429,9 @@ def main() -> None:
             result = fn(inp) if fn else f"[unknown tool: {name}]"
             messages.append({"role": "tool", "tool_call_id": tc.id,
                              "content": str(result)})
-            emit({"type": "tool_result", "name": name})
+            emit({"type": "tool_result", "name": name, "output": _cap(str(result), 800)})
 
-    emit({"type": "result", "subtype": "error_max_turns"})
+    _finish("error_max_turns")
     print(f"[litellm-agent] hit --max-turns ({a.max_turns}) without finishing",
           file=sys.stderr)
     sys.exit(1)

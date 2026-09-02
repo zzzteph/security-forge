@@ -118,20 +118,34 @@ def next_targets(count: int, rescan: bool = False, known_only: bool = False) -> 
     return [t for t in r if t.get("slug")] if isinstance(r, list) else []
 
 
-def build_prompt(repo_url: str, slug: str, timeout: int) -> str:
+def build_prompt(repo_url: str, slug: str, timeout: int, verify: bool = False) -> str:
     mins = max(1, timeout // 60)
-    reserve = 3 if mins <= 45 else 5   # minutes to keep back for record + nuke
+    reserve = 3 if mins <= 45 else 5
+    if verify:
+        hunt = ("verify every candidate in the container sandbox, write an advisory "
+                "+ runnable PoC for each verified finding, then run ")
+        tail = (f"`python scripts/org.py record --repo {repo_url}` to fold the "
+                f"findings into the DB and mark it analyzed, and finally `python "
+                f"scripts/verify.py nuke`. ")
+    else:
+        hunt = ("do NOT run any DAST/Docker verification (verification is DISABLED: "
+                "never call verify.py / verify-poc / docker / compose / a "
+                "finding-verifier, never build/run the target) — for each candidate "
+                "write a rigorous STATIC source->sink rationale (mark it unverified) "
+                "+ a PoC SKETCH, then run ")
+        tail = (f"`python scripts/org.py record --repo {repo_url}` to fold the "
+                f"findings into the DB and mark it analyzed. (No nuke — no sandbox.) ")
     return (
         f"You are analyzing EXACTLY ONE repository: {repo_url} (slug {slug}). "
         f"SECFORGE_TARGET_REPO is already set to it in your environment, so every "
-        f"`python scripts/...` call keys to this repo. Follow opt/workflow.md end "
-        f"to end for THIS repo only: run `python scripts/pipeline.py prep`, build/"
-        f"refresh its model in knowledge/, hunt for real MEDIUM/HIGH/CRITICAL bugs, "
-        f"verify every candidate in the container sandbox, write an advisory + "
-        f"runnable PoC for each verified finding, then run "
-        f"`python scripts/org.py record --repo {repo_url}` to fold the findings "
-        f"into the DB and mark it analyzed, and finally `python scripts/verify.py "
-        f"nuke`. Do NOT analyze any other repo, do NOT loop to a next repo, never "
+        f"`python scripts/...` call keys to this repo. The repo is ALREADY cloned "
+        f"and prepped at target/ by the orchestrator — do NOT clone, do NOT run "
+        f"`pipeline.py prep`, do NOT git-fetch/clone (you have no credentials in "
+        f"this session; the code is already on disk). Follow opt/workflow.md end to "
+        f"end for THIS repo only: read the prepped tree + `python scripts/pipeline.py "
+        f"shape` and any knowledge/ model, hunt for real MEDIUM/HIGH/CRITICAL bugs, "
+        f"{hunt}{tail}"
+        f"Do NOT analyze any other repo, do NOT loop to a next repo, never "
         f"ask questions, keep everything local (notify-only). Stop as soon as this "
         f"one repo is recorded. "
         f"CRITICAL — HARD DEADLINE: this session is force-killed at ~{mins} minutes "
@@ -143,21 +157,20 @@ def build_prompt(repo_url: str, slug: str, timeout: int) -> str:
         f"return WITHIN this turn, then continue. Do not pause, yield, or schedule "
         f"a continuation. "
         f"(2) CHECKPOINT AS YOU GO — `add-finding` each bug the MOMENT it clears the "
-        f"bar, and `set-status` right after you verify it; never batch findings to "
-        f"the end. A confirmed finding still sitting in your head when the deadline "
-        f"hits is a finding lost, so persist early and often. "
+        f"bar (with description, impact, root_cause/why, remediation, reachability — "
+        f"never a one-liner), and `set-status` right after; never batch to the end. "
         f"(3) BREADTH BEFORE DEPTH on a large repo — cap subagent fan-out to the "
-        f"config budget (analysis.max_recon_agents / max_authz_agents / "
-        f"max_analyzer_agents) and cover the highest-value areas first. It is FINE "
-        f"to finish a cycle with only partial coverage recorded: the next "
-        f"(incremental) run resumes from the persisted knowledge/ model, so do NOT "
-        f"try to exhaustively analyze AND verify a huge codebase in a single cycle. "
-        f"(4) LAND THE PLANE — keep the last ~{reserve} minutes to run BOTH `python "
-        f"scripts/org.py record --repo {repo_url}` AND `python scripts/verify.py "
-        f"nuke`. If time is running short, STOP hunting, record what you already "
-        f"have, then record + nuke. Ending the turn cleanly with findings recorded "
-        f"always beats being killed mid-analysis with the work unsaved. Your turn "
-        f"MUST NOT end until BOTH record AND nuke have actually run for this repo."
+        f"config budget and cover the highest-value areas (authz/IDOR, injection, "
+        f"secrets) first. Partial coverage recorded is FINE: the next incremental "
+        f"run resumes from the persisted knowledge/ model. "
+        + (f"(4) LAND THE PLANE — keep the last ~{reserve} minutes to run BOTH "
+           f"`python scripts/org.py record --repo {repo_url}` AND `python "
+           f"scripts/verify.py nuke`. If short on time, record what you have, then "
+           f"record + nuke. Your turn MUST NOT end until BOTH record AND nuke have run."
+           if verify else
+           f"(4) LAND THE PLANE — keep the last ~{reserve} minutes to run `python "
+           f"scripts/org.py record --repo {repo_url}`. If short on time, record what "
+           f"you have. Your turn MUST NOT end until record has run. (No nuke — no sandbox.)")
     )
 
 
@@ -585,6 +598,32 @@ def resolve_backend(args, cfg: dict) -> AgentBackend:
     return b
 
 
+def prep_target(repo_url: str, env_extra: dict) -> tuple[bool, str]:
+    """Clone/prep the target IN THE ORCHESTRATOR — before launching the headless
+    agent — because the orchestrator is attached to the user's console, where git
+    and its credential manager authenticate normally (the agent's headless session
+    cannot). A local folder path is prepped in place (no clone). SECFORGE_GIT_
+    INTERACTIVE lets the clone use the console's normal git auth. Returns (ok, detail)."""
+    import shutil
+    if not shutil.which("git"):
+        return False, "git not found on PATH — install git so the orchestrator can clone"
+    env = {**os.environ, **env_extra, "SECFORGE_GIT_INTERACTIVE": "1"}
+    r = subprocess.run([PY, str(ROOT / "scripts" / "pipeline.py"), "prep"],
+                       cwd=str(ROOT), capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", env=env)
+    if r.returncode != 0:
+        msg = re.sub(r"x-access-token:[^@]+@", "x-access-token:***@",
+                     ((r.stdout or "") + (r.stderr or ""))).strip().splitlines()
+        return False, (msg[-1] if msg else "prep failed")[:200]
+    try:
+        commit = (json.loads(r.stdout) or {}).get("commit")
+    except Exception:
+        commit = None
+    if not commit:
+        return False, "prep produced no commit (clone failed / empty repo)"
+    return True, commit[:8]
+
+
 def process_repo(t: dict, args, logs: Path, idx: int, total) -> str:
     """Run one bounded session for a single repo, tear down, and return its final
     DB status. Shared by the org-drain loop and the single --repo path."""
@@ -596,14 +635,24 @@ def process_repo(t: dict, args, logs: Path, idx: int, total) -> str:
     if os.environ.get("SECFORGE_DATA_DIR"):
         env_extra["SECFORGE_DATA_DIR"] = os.environ["SECFORGE_DATA_DIR"]
     env_extra.update(getattr(args, "_agent_env", {}))   # provider keys from --agent-env
+    orgdb("set-status", "--slug", slug, "--status", "cloning")
+    print(f"[orch] ({idx}/{total}) {slug} → clone/prep …", flush=True)
+    # 1) Clone + prep HERE (console git works). Only launch the agent if it succeeds
+    #    — no point spending a session on a repo we couldn't fetch.
+    ok, detail = prep_target(repo_url, env_extra)
+    if not ok:
+        orgdb("set-status", "--slug", slug, "--status", "error", "--error", detail)
+        print(f"[orch]   ✗ prep failed: {detail} — skipped (no agent session spent)")
+        return "error"
     orgdb("set-status", "--slug", slug, "--status", "analyzing")
-    print(f"[orch] ({idx}/{total}) {slug} → session (≤{args.timeout}s)  log: {log}",
+    print(f"[orch]   ✓ prepped @ {detail} → agent session (≤{args.timeout}s)  log: {log}",
           flush=True)
     t0 = time.monotonic()
-    rc = run_session(build_prompt(repo_url, slug, args.timeout), env_extra,
+    rc = run_session(build_prompt(repo_url, slug, args.timeout,
+                                  verify=getattr(args, "verify", False)), env_extra,
                      args._backend, args.model, args.timeout, log, args.heartbeat,
                      args.silent)
-    cleanup(slug, env_extra)
+    cleanup(slug, env_extra, verify=getattr(args, "verify", False))
     orgdb("reap-stale", "--max-attempts", str(args.max_attempts))
     row = orgdb("show", "--slug", slug) or {}
     st = row.get("status")
@@ -656,13 +705,14 @@ def _salvage_str(sv: dict | None) -> str:
             f"CRIT={sv.get('critical', 0)})")
 
 
-def cleanup(slug: str, env_extra: dict):
-    """Guarantee teardown after every session: nuke the sandbox and wipe this
-    repo's disposable clone + scratch so the next repo starts clean, even on a
-    kill. knowledge/ (the durable model) and the DB are kept."""
-    subprocess.run([PY, str(ROOT / "scripts" / "verify.py"), "nuke"],
-                   cwd=str(ROOT), capture_output=True, text=True,
-                   env={**os.environ, **env_extra})
+def cleanup(slug: str, env_extra: dict, verify: bool = False):
+    """Guarantee teardown after every session: nuke the sandbox (only if --verify;
+    otherwise there's no Docker sandbox) and wipe this repo's disposable clone +
+    scratch so the next repo starts clean. knowledge/ and the DB are kept."""
+    if verify:
+        subprocess.run([PY, str(ROOT / "scripts" / "verify.py"), "nuke"],
+                       cwd=str(ROOT), capture_output=True, text=True,
+                       env={**os.environ, **env_extra})
     import shutil
     data = data_root()
     for sub in ("target", "state"):
@@ -743,6 +793,10 @@ def main():
     ap.add_argument("--model", default="", help="optional model to pass through "
                     "(claude-code: normalized, e.g. opus4.8 -> claude-opus-4-8; "
                     "cli-adapter: passed verbatim, e.g. gpt-5, gemini-2.5-pro)")
+    ap.add_argument("--verify", action="store_true",
+                    help="enable DAST/Docker-sandbox verification. OFF by default: "
+                         "runs static-only (no Docker, no verify-poc, no nuke); "
+                         "findings recorded as unverified candidates.")
     ap.add_argument("--heartbeat", type=int, default=30,
                     help="seconds between progress heartbeats (default: 30)")
     ap.add_argument("--silent", action="store_true",

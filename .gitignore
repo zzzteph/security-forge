@@ -7,6 +7,7 @@
 # Pipeline state & scratch
 /state/
 /logs/
+/findings/
 /reports/
 
 # Per-target models/findings/advisories/PoCs (regenerated each run; the durable

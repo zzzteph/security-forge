@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -21,6 +22,31 @@ TREE_MANIFEST = STATE_DIR / "tree_manifest.json"
 _GH_COM = {"github.com", "www.github.com"}
 
 
+def _rmtree_force(path) -> None:
+    """Remove a directory tree even when it holds read-only files — git writes
+    read-only pack files into .git/objects, and a plain shutil.rmtree(ignore_errors)
+    silently SKIPS them on Windows, leaving the dir non-empty so the next clone
+    fails 'destination already exists'. This clears the read-only bit and retries."""
+    import shutil
+    import stat
+
+    def _onerror(func, p, _exc):
+        try:
+            os.chmod(p, stat.S_IWRITE)
+            func(p)
+        except Exception:  # noqa: BLE001
+            pass
+
+    try:
+        # Python 3.12+ prefers onexc; fall back to onerror on older/newer alike.
+        try:
+            shutil.rmtree(path, onexc=lambda f, p, e: _onerror(f, p, e))
+        except TypeError:
+            shutil.rmtree(path, onerror=_onerror)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _host_of(url: str) -> str:
     s = (url or "").strip()
     if "://" in s:
@@ -30,9 +56,27 @@ def _host_of(url: str) -> str:
     return s.split("/", 1)[0].split(":", 1)[0]
 
 
+def _git_credential_token(host: str) -> str:
+    """Token from git's credential store (Git Credential Manager) for this host —
+    the same creds a console `git clone` uses. Injected into the clone URL so the
+    clone works even where GCM won't respond non-interactively."""
+    try:
+        r = subprocess.run(["git", "credential", "fill"],
+                           input=f"protocol=https\nhost={host}\n\n",
+                           capture_output=True, text=True, timeout=15,
+                           env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+        if r.returncode == 0:
+            d = dict(ln.split("=", 1) for ln in r.stdout.splitlines() if "=" in ln)
+            return (d.get("password") or "").strip()
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
 def _token_for(host: str) -> str:
-    """Same per-host token resolution as scripts/org.py: a host-specific var
-    wins, then the generic enterprise token, then classic GITHUB_TOKEN/GH_TOKEN."""
+    """Token to inject into the clone URL: a host-specific env var wins, then the
+    generic enterprise token, then classic GITHUB_TOKEN/GH_TOKEN, then git's
+    credential store (the console's own creds)."""
     load_env()
     cands = ["GITHUB_TOKEN_" + re.sub(r"[^A-Za-z0-9]", "_", host).upper()]
     if host not in _GH_COM:
@@ -42,7 +86,7 @@ def _token_for(host: str) -> str:
         v = (os.environ.get(name) or "").strip()
         if v:
             return v
-    return ""
+    return _git_credential_token(host)
 
 
 def _authed_url(url: str) -> str:
@@ -60,8 +104,16 @@ def _authed_url(url: str) -> str:
 
 
 def _git_env() -> dict:
-    """Never hang an unattended clone on a credential prompt — fail fast instead."""
-    return {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}
+    """Git env for clone/fetch. Default is fail-fast (no credential prompt) so an
+    UNATTENDED agent session never hangs. But when SECFORGE_GIT_INTERACTIVE is set
+    — which the orchestrator sets for its OWN pre-clone step (it's attached to the
+    user's console, where git + GCM authenticate normally) — allow the normal
+    prompt/credential-manager flow so private repos clone just like from the console."""
+    env = {**os.environ}
+    if not (os.environ.get("SECFORGE_GIT_INTERACTIVE") or "").strip():
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        env["GCM_INTERACTIVE"] = "never"
+    return env
 
 SKIP_DIRS = {".git", "node_modules", "vendor", "dist", "build", ".venv", "venv",
              "__pycache__", ".next", "target", ".gradle", ".idea"}
@@ -83,11 +135,36 @@ COMPOSE_NAMES = {"docker-compose.yml", "docker-compose.yaml", "compose.yml", "co
 def git(args, cwd=TARGET_DIR):
     if cwd and not Path(cwd).exists():
         return 128, "", f"cwd does not exist: {cwd}"
-    return run(["git", *args], cwd=cwd, env=_git_env())
+    # CRITICAL (tool runs from inside its own git repo): pin GIT_DIR/GIT_WORK_TREE
+    # to THIS clone so git can never walk up into security-forge's own repo. Without
+    # it, a fetch/reset on a missing/broken target clone ascends to the parent and
+    # `git reset --hard origin/main` HARD-RESETS the tool's own working tree. Pinned,
+    # such a command fails cleanly ("not a git repository") instead of wiping it.
+    env = _git_env()
+    env["GIT_DIR"] = str(Path(cwd) / ".git")
+    env["GIT_WORK_TREE"] = str(cwd)
+    return run(["git", *args], cwd=cwd, env=env)
+
+
+def _is_valid_clone() -> bool:
+    """True only if TARGET_DIR is its OWN git repo with >=1 commit. Guards against a
+    partial/interrupted clone (a .git with only objects/ and no HEAD) that would
+    otherwise get stuck in the 'update' path forever and report no commit."""
+    if not (TARGET_DIR / ".git").exists():
+        return False
+    rc, out, _ = git(["rev-parse", "--show-toplevel"])
+    if rc != 0 or not out.strip():
+        return False
+    try:
+        if Path(out.strip()).resolve() != Path(TARGET_DIR).resolve():
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+    return git(["rev-parse", "--verify", "HEAD"])[0] == 0
 
 
 def current_commit() -> str | None:
-    if not (TARGET_DIR / ".git").exists():
+    if not _is_valid_clone():
         return None
     rc, out, _ = git(["rev-parse", "HEAD"])
     return out.strip() if rc == 0 else None
@@ -211,7 +288,14 @@ def clone_or_update(cfg: dict) -> dict:
     prev = read_last_commit()
     if is_local_path(url):               # a local source folder, not a remote URL
         return _prep_local(url, branch, depth, prev)
-    if not (TARGET_DIR / ".git").exists():
+    if not _is_valid_clone():
+        # No clone yet, or a broken/partial one from a killed run — wipe and clone fresh.
+        if TARGET_DIR.exists():
+            eprint("[repo] removing stale/partial clone before re-cloning")
+            _rmtree_force(TARGET_DIR)
+            if TARGET_DIR.exists():   # something is holding files (AV / open handle)
+                raise SystemExit(f"[repo] could not remove stale clone at {TARGET_DIR} — "
+                                 f"close anything using it (editor/AV/git) and retry.")
         eprint(f"[repo] cloning {url}")
         args = ["clone"]
         if depth:
