@@ -116,37 +116,32 @@ actually reproduced.
 
 ## Run it in Docker
 
-Published to GHCR on every push (multi-arch: amd64 + arm64/Raspberry Pi):
+**One image, run as CLI or UI.** Published to GHCR on every push (multi-arch:
+amd64 + arm64/Raspberry Pi):
 
 ```bash
 docker pull ghcr.io/zzzteph/security-forge:latest
 ```
 
-security-forge runs its own verification sandbox, so give the container a Docker
-daemon (mount the host socket) and, on Linux, host networking so the sandbox's
-port-binding and probes line up:
+**Web UI** — continuous scanning, findings, advisories, PDF export (login root/root):
 
 ```bash
-# analyze a local folder with Claude Code
-docker run --rm -it \
-  --network host \
-  -v /var/run/docker.sock:/var/run/docker.sock \
-  -v "$PWD/sf-data:/data" \
-  -e ANTHROPIC_API_KEY=sk-... \
-  ghcr.io/zzzteph/security-forge:latest --path /data/mysrc --model opus4.8
-
-# or a whole org with the native LiteLLM backend (no Claude CLI needed)
-docker run --rm -it \
-  --network host \
-  -v /var/run/docker.sock:/var/run/docker.sock \
-  -v "$PWD/sf-data:/data" \
+docker run --rm -p 8000:8000 -v "$PWD/sf-data:/data" \
   -e OPENAI_API_KEY=sk-... \
-  ghcr.io/zzzteph/security-forge:latest \
-  --org OWNER --backend litellm --model openai/gpt-5
+  ghcr.io/zzzteph/security-forge:latest ui
+# → http://localhost:8000     (or: docker compose up)
 ```
 
-Put source to analyze under `./sf-data` (mounted at `/data`) and everything —
-`db/`, `knowledge/`, and the central `reports/` — persists there. There's also a
-`docker-compose.yml` for convenience, and you can build locally with
-`docker build -t security-forge .` (add `--build-arg INSTALL_CLAUDE=false` for a
-lean, LiteLLM-only image). Full details in [docs/DOCKER.md](docs/DOCKER.md).
+**CLI** — the same image, pass orchestrator args instead of `ui`:
+
+```bash
+docker run --rm -v "$PWD/sf-data:/data" -e OPENAI_API_KEY=sk-... \
+  ghcr.io/zzzteph/security-forge:latest \
+  --path /data/mysrc --backend litellm --model openai/gpt-5
+```
+
+Everything (`db/`, `knowledge/`, central `reports/`, agent logins) persists in the
+mounted `/data`. The container does **static analysis only** — `--verify` needs a
+Docker daemon (Docker-in-Docker), so run verification on a host directly. Build
+locally with `docker build -t security-forge .`. Full details in
+[docs/DOCKER.md](docs/DOCKER.md).

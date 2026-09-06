@@ -1,10 +1,15 @@
 # Running security-forge in Docker
 
-security-forge is packaged as a container image that bundles the pipeline with
-Python, `git`, `ripgrep`, and the Docker CLI + compose plugin. The one thing to
-understand up front: **security-forge runs Docker itself** — its verification step
-builds and runs the target application in throwaway containers to prove a finding
-is real. So the container needs access to a Docker daemon.
+**One image, run as CLI or UI.** The `security-forge` image bundles the pipeline
+(Python, `git`, `ripgrep`), the web UI, and the agent CLIs. The entrypoint
+dispatches:
+
+- `… security-forge ui` → the **web UI** (uvicorn on :8000).
+- `… security-forge <orchestrator args>` → the **CLI** orchestrator.
+
+It does **static analysis only** — `--verify` builds and runs the target, which
+needs a Docker daemon (Docker-in-Docker), so run verification on a host directly,
+not in the container.
 
 ## Image
 
@@ -43,8 +48,8 @@ Build it yourself instead:
 
 ```bash
 docker build -t security-forge .
-# lean image without Node/Claude Code (uses the litellm backend):
-docker build --build-arg INSTALL_CLAUDE=false -t security-forge .
+# lean image without the Node agent CLIs (uses the native litellm backend):
+docker build --build-arg INSTALL_AGENTS=false -t security-forge .
 ```
 
 ## The container does STATIC analysis only — no verification

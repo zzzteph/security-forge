@@ -1,26 +1,26 @@
-# Convenience runner for the security-forge image.
+# security-forge — one image, run as UI (here) or CLI (docker run … <orchestrator args>).
 #
-#   docker compose build                       # or: docker compose pull
-#   ANTHROPIC_API_KEY=sk-... docker compose run --rm security-forge --path /data/mysrc --model opus4.8
+#   OPENAI_API_KEY=sk-... docker compose up --build
+#   open http://localhost:8000   (login root / root — you'll be forced to change it)
 #
-# Put source you want analyzed under ./sf-data (mounted at /data) and point --path there.
+#   # one-off CLI scan with the same image:
+#   docker compose run --rm security-forge --path /data/mysrc --backend litellm --model openai/gpt-5
+#
+# Static analysis only (no verification → no Docker socket needed). Data persists in ./sf-data.
 services:
   security-forge:
     build: .
     image: ghcr.io/zzzteph/security-forge:latest
-    # Linux host: host networking makes the verify sandbox's 127.0.0.1 port-binding
-    # and HTTP probes line up with the containers it launches on the host daemon.
-    network_mode: host
+    command: ["ui"]                 # omit / override with orchestrator args for CLI mode
+    ports:
+      - "8000:8000"
     volumes:
-      # Docker-out-of-Docker: run the verification sandbox on the host daemon.
-      - /var/run/docker.sock:/var/run/docker.sock
-      # Persist db / knowledge / reports / logs (and stage local source to analyze).
-      - ./sf-data:/data
+      - ./sf-data:/data             # db, knowledge, logs, agent logins — all persisted here
     environment:
-      # Set only the ones your backend/targets need.
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}   # claude-code backend
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}         # litellm/codex/aider
-      GEMINI_API_KEY: ${GEMINI_API_KEY:-}         # gemini
-      GITHUB_TOKEN: ${GITHUB_TOKEN:-}             # private repo listing/cloning
-    # Override per run on the command line (this is the default when none given):
-    command: ["--help"]
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      SECFORGE_LLM_API_KEY: ${SECFORGE_LLM_API_KEY:-}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      SECFORGE_UI_SECRET: ${SECFORGE_UI_SECRET:-}
+    restart: unless-stopped

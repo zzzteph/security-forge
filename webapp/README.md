@@ -9,21 +9,21 @@ no notifications, everything in the DB.
 
 ## Run it
 
+The UI ships in the **single `security-forge` image** — run it with the `ui`
+command (the CLI is the same image with orchestrator args instead).
+
 ```bash
-cd webapp
+# from the repo root
 OPENAI_API_KEY=sk-... docker compose up --build
 # open http://localhost:8000   — login  root / root  (you must change it on first login)
+
+# or by hand:
+docker run --rm -p 8000:8000 -v "$PWD/sf-data:/data" -e OPENAI_API_KEY=sk-... \
+  ghcr.io/zzzteph/security-forge:latest ui
 ```
 
-Or build/run by hand (from the repo root):
-
-```bash
-docker build -f webapp/Dockerfile -t security-forge-ui .
-docker run --rm -p 8000:8000 -v "$PWD/sf-data:/data" -e OPENAI_API_KEY=sk-... security-forge-ui
-```
-
-Published to GHCR on every push: `ghcr.io/zzzteph/security-forge-ui:latest`
-(multi-arch amd64 + arm64).
+Published to GHCR on every push: `ghcr.io/zzzteph/security-forge:latest`
+(multi-arch amd64 + arm64). See [../docs/DOCKER.md](../docs/DOCKER.md).
 
 ## What you can do
 
