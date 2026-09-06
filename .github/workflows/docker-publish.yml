@@ -15,6 +15,16 @@ permissions:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # the engine image  -> ghcr.io/<owner>/<repo>
+          - image: ghcr.io/${{ github.repository }}
+            dockerfile: Dockerfile
+          # the web UI image  -> ghcr.io/<owner>/<repo>-ui
+          - image: ghcr.io/${{ github.repository }}-ui
+            dockerfile: webapp/Dockerfile
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -36,8 +46,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          # -> ghcr.io/<owner>/<repo>  (lowercased automatically)
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ matrix.image }}   # lowercased automatically
           tags: |
             # Release tags: pushing git tag v1.2.3 publishes image tags 1.2.3, 1.2, 1.
             type=semver,pattern={{version}}
@@ -54,10 +63,11 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: ${{ matrix.dockerfile }}
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           # Speed up repeat builds (the Node/Claude + apt layers are the slow part).
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ matrix.dockerfile }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.dockerfile }}

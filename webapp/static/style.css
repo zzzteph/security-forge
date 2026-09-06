@@ -1,0 +1,73 @@
+:root{
+  --bg:#0d1117; --panel:#141a22; --panel2:#1b2330; --line:#242c3a;
+  --fg:#d6dee8; --muted:#8b97a7; --accent:#4a9eff; --accent2:#2b6fd6;
+  --crit:#e5484d; --high:#f0883e; --med:#d6b400; --low:#6b7688; --ok:#3fb950;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+  font:14px/1.5 -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
+button{font:inherit;cursor:pointer;border:1px solid var(--line);background:var(--panel2);
+  color:var(--fg);padding:6px 12px;border-radius:6px}
+button:hover{border-color:var(--accent)}
+button.primary{background:var(--accent2);border-color:var(--accent2);color:#fff}
+button.danger{border-color:var(--crit);color:#ff9a9d}
+button.sm{padding:3px 10px;font-size:12px}
+button+button{margin-left:8px}          /* inline groups (e.g. table actions) never touch */
+.flex button+button{margin-left:0}      /* flex rows already space with gap */
+input,select,textarea{font:inherit;background:var(--bg);color:var(--fg);
+  border:1px solid var(--line);border-radius:6px;padding:7px 9px;width:100%}
+textarea{resize:vertical;min-height:70px}
+label{display:block;margin:10px 0 4px;color:var(--muted);font-size:12px}
+.row{display:flex;gap:12px;flex-wrap:wrap} .row>*{flex:1;min-width:160px}
+
+/* layout */
+.wrap{display:flex;min-height:100vh}
+.side{width:210px;background:var(--panel);border-right:1px solid var(--line);
+  padding:16px 0;position:sticky;top:0;height:100vh}
+.brand{font-weight:700;font-size:16px;padding:0 18px 14px;color:#fff}
+.brand small{display:block;color:var(--muted);font-weight:400;font-size:11px}
+.nav a{display:block;padding:9px 18px;color:var(--muted);border-left:3px solid transparent}
+.nav a.on{color:#fff;background:var(--panel2);border-left-color:var(--accent)}
+.main{flex:1;padding:22px 26px;max-width:1200px}
+.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}
+h1{font-size:20px;margin:0} h2{font-size:15px;margin:18px 0 8px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:16px}
+.stat{display:inline-block;min-width:96px;margin-right:10px}
+.stat b{display:block;font-size:26px} .stat span{color:var(--muted);font-size:12px}
+
+/* table */
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.03em}
+tr:hover td{background:var(--panel2)}
+.mono{font-family:"SF Mono",Consolas,monospace;font-size:12px}
+.muted{color:var(--muted)} .nowrap{white-space:nowrap}
+
+/* badges */
+.badge{display:inline-block;padding:1px 8px;border-radius:20px;font-size:11px;font-weight:700;color:#0d1117}
+.b-CRITICAL{background:var(--crit);color:#fff} .b-HIGH{background:var(--high)}
+.b-MEDIUM{background:var(--med)} .b-LOW{background:var(--low);color:#fff}
+.pill{padding:1px 8px;border-radius:20px;font-size:11px;border:1px solid var(--line)}
+.pill.open{color:#ff9a9d;border-color:var(--crit)} .pill.mitigated{color:var(--ok);border-color:var(--ok)}
+.pill.running{color:var(--accent)} .pill.done{color:var(--ok)} .pill.error{color:#ff9a9d}
+.pill.queued{color:var(--muted)}
+
+/* login */
+.login{max-width:340px;margin:12vh auto;text-align:center}
+.login .card{text-align:left}
+.err{color:#ff9a9d;font-size:13px;margin:8px 0}
+.ok{color:var(--ok);font-size:13px;margin:8px 0}
+
+/* modal */
+.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;
+  align-items:center;justify-content:center;z-index:50}
+.modal{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+  padding:20px;width:min(560px,92vw);max-height:88vh;overflow:auto}
+pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:12px;
+  overflow:auto;font-family:"SF Mono",Consolas,monospace;font-size:12px;white-space:pre-wrap}
+.log{max-height:60vh;overflow:auto}
+.right{text-align:right} .flex{display:flex;gap:8px;align-items:center}
+.spacer{flex:1}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
+.dot.on{background:var(--ok)} .dot.off{background:var(--low)}

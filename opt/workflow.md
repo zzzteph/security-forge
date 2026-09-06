@@ -396,10 +396,21 @@ source→sink path in the throwaway clone** (or enables the app's own query/SQL
 logging as the equivalent evidence), rebuilds, fires the exploit (injection marker
 / `{{7*191}}` / loopback SSRF sentinel / two-principal IDOR), and reads
 `docker logs` / the HTTP response to prove the tainted value reached the sink.
-For any finding whose **runtime precondition is unmet** (plugin/feature not shipped
-in the default build, dialect-specific, etc.), verify against a config that DOES
-ship it where reasonable; if it is genuinely unreachable in a real deployment,
-`triaged` it with the concrete reason rather than reporting it as live. Keep going
+**You MUST exploit the REAL, running application, consistently — never a library
+harness.** "Verified" means the actual app is built and booted and the exploit is
+fired over its real attacker-facing entry point (the HTTP route / API / upload from
+the model). A standalone library/unit harness that drives the vulnerable dependency
+in isolation (a Maven/JUnit/etc. program that calls the parser/serializer/SAXBuilder
+directly) is **NOT** verification and must never be labelled `verified` or shipped as
+the PoC — it only shows the library does what libraries do, not that *this app* is
+exploitable. Do not "optimize" a slow build away with a harness: the verify run has
+no time budget, so build the real target (its own Dockerfile/compose, or one built
+from its real build system). If, after a genuine effort, the real app cannot be
+built/run, mark the finding `triaged` (or `could_not_run`) with the concrete blocker
+— **not** `verified`. For a finding whose **runtime precondition is unmet**
+(plugin/feature not in the default build, dialect-specific, etc.), boot a real
+deployment configured to ship it where reasonable; if it is genuinely unreachable in
+any real deployment, `triaged` it with the reason. Keep going
 until **every** finding has a verdict — do not stop at `max_verify_per_cycle`.
 **Persist the reproducible artifacts:** whatever the verifier built to prove a
 `verified` finding (Dockerfile / `docker-compose.yml`, the seed/setup script, the
@@ -558,6 +569,11 @@ executive summary.)
 └── README.md              # the manual (below)
 ```
 Requirements:
+- **Boots the REAL app, not a harness.** `docker-compose.yml` must stand up the
+  actual target application and `poc.py` must drive its real entry point. A bundle
+  that boots a library/unit harness (a program that calls the vulnerable dependency
+  directly) is invalid — it does not prove *this app* is exploitable and must not be
+  shipped or counted as verified.
 - **Two-command UX.** The README's happy path must be: (1) `docker compose -p <slug> up -d`
   (wait for ready), then (2) `python poc.py` — which authenticates, performs any
   seed if `setup.*` isn't auto-run, fires the exploit, prints the request/response
