@@ -1,5 +1,9 @@
 # Secrets & per-copy config values
 .env
+secrets.env
+
+# Local UI data volume (DB, reports, findings, logs) mounted into the container
+/sf-data/
 
 # Cloned target repository (re-created on each run)
 /target/

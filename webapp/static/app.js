@@ -14,7 +14,7 @@ createApp({
       login: { username: 'root', password: '', err: '' },
       pw: { show: false, current: '', next: '', msg: '', err: '' },
       counts: {}, findings: [], findingFilter: { status: 'open', min_sev: '', triage: '' },
-      commentDraft: '', triageMsg: '',
+      commentDraft: '', triageMsg: '', hideFP: false,
       repos: [], runner: { running: null, queued: 0 },
       backends: [], backendsHome: '/data/home', authModal: null,
       settings: { defaults: { backend: 'litellm', model: '', base_url: '', max_turns: '',
@@ -37,6 +37,7 @@ createApp({
     },
     activeScans() { return (this.scans || []).filter(s => ['queued', 'running'].includes(s.status)); },
     recentScans() { return (this.scans || []).slice(0, 6); },
+    dashFindings() { return this.hideFP ? this.findings.filter(f => f.triage !== 'false_positive') : this.findings; },
   },
   methods: {
     async api(method, path, body) {
@@ -418,17 +419,19 @@ createApp({
         </tbody></table>
       </div>
       <div class="card">
-        <h2>Open findings</h2>
+        <div class="flex" style="margin-bottom:8px"><h2 style="margin:0">Open findings</h2><span class="spacer"></span>
+          <label class="switch"><input type="checkbox" v-model="hideFP"><span class="track"></span>Hide false positives</label></div>
         <table><thead><tr>
           <th @click="toggleSort('dash','severity')" style="cursor:pointer">Sev{{caret('dash','severity')}}</th>
           <th @click="toggleSort('dash','slug')" style="cursor:pointer">Project{{caret('dash','slug')}}</th>
           <th @click="toggleSort('dash','title')" style="cursor:pointer">Title{{caret('dash','title')}}</th>
           <th @click="toggleSort('dash','file')" style="cursor:pointer">Where{{caret('dash','file')}}</th></tr></thead>
-        <tbody><tr v-for="f in sortRows(findings,'dash').slice(0,25)" :key="f.id" @click="openFinding(f); view='finding'" style="cursor:pointer">
+        <tbody><tr v-for="f in sortRows(dashFindings,'dash').slice(0,25)" :key="f.id" @click="openFinding(f); view='finding'" style="cursor:pointer">
           <td><span class="badge" :class="'b-'+f.severity">{{f.severity}}</span></td>
-          <td class="muted">{{f.slug}}</td><td>{{f.title}}</td>
+          <td class="muted">{{f.slug}}</td>
+          <td>{{f.title}}<span v-if="f.triage && f.triage!=='unset'" class="tri" :class="'tri-'+f.triage">{{triageShort(f.triage)}}</span></td>
           <td class="mono muted">{{f.file}}{{f.line?':'+f.line:''}}</td></tr>
-          <tr v-if="!findings.length"><td colspan="4" class="muted">No open findings.</td></tr></tbody></table>
+          <tr v-if="!dashFindings.length"><td colspan="4" class="muted">{{hideFP && findings.length ? 'All open findings are marked false positive.' : 'No open findings.'}}</td></tr></tbody></table>
       </div>
     </div>
 
