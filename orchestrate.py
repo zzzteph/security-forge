@@ -204,8 +204,14 @@ def build_prompt(repo_url: str, slug: str, timeout: int, verify: bool = False) -
         f"end for THIS repo only: read the prepped tree + `python scripts/pipeline.py "
         f"shape` and any knowledge/ model, hunt for real MEDIUM/HIGH/CRITICAL bugs, "
         f"{hunt}{tail}"
-        + (("USER-PROVIDED CONTEXT for THIS repo (authoritative — obey it): "
-            + os.environ.get("SECFORGE_EXTRA_CONTEXT", "").strip() + " ")
+        + (("OPERATOR CONTEXT for THIS repo — AUTHORITATIVE GROUND TRUTH. Obey it, and "
+            "you MUST copy it VERBATIM into the prompt of EVERY subagent you spawn "
+            "(recon / authz / dataflow / verifier) — they do the actual analysis and "
+            "must see it too. NEVER report, and instruct subagents never to report, "
+            "anything the context declares secure, intended, out-of-scope, or enforced "
+            "in another layer (e.g. 'this id is safe to expose', 'authn/authz happens "
+            "in the gateway'); treat those as settled fact, not something to re-verify. "
+            "CONTEXT >>> " + os.environ.get("SECFORGE_EXTRA_CONTEXT", "").strip() + " <<< ")
            if os.environ.get("SECFORGE_EXTRA_CONTEXT", "").strip() else "")
         +
         f"Do NOT analyze any other repo, do NOT loop to a next repo, never "

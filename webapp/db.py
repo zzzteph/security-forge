@@ -85,6 +85,11 @@ def init() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_comment_find ON finding_comments(finding_uuid);
             CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT);
+            CREATE TABLE IF NOT EXISTS skills (
+                id INTEGER PRIMARY KEY, name TEXT NOT NULL,
+                content TEXT NOT NULL DEFAULT '', enabled INTEGER DEFAULT 1,
+                created TEXT, updated TEXT
+            );
             CREATE INDEX IF NOT EXISTS idx_find_repo ON findings(repo_id);
             CREATE INDEX IF NOT EXISTS idx_find_sev  ON findings(severity);
             CREATE INDEX IF NOT EXISTS idx_scan_repo ON scans(repo_id);
@@ -512,40 +517,115 @@ def list_comments(finding_uuid: str) -> list[dict]:
             "SELECT * FROM finding_comments WHERE finding_uuid=? ORDER BY id", (finding_uuid,))]
 
 
+# --- skills (operator-uploaded .md playbooks, injected into every scan) ----------
+
+def list_skills() -> list[dict]:
+    with connect() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT id,name,enabled,LENGTH(content) AS size,created,updated "
+            "FROM skills ORDER BY name")]
+
+
+def get_skill(sid: int) -> dict | None:
+    with connect() as c:
+        r = c.execute("SELECT * FROM skills WHERE id=?", (sid,)).fetchone()
+    return dict(r) if r else None
+
+
+def upsert_skill(data: dict, sid: int | None = None) -> int:
+    name = (data.get("name") or "skill").strip()[:120]
+    content = data.get("content") or ""
+    enabled = 1 if data.get("enabled", True) else 0
+    with connect() as c:
+        if sid:
+            c.execute("UPDATE skills SET name=?, content=?, enabled=?, updated=? WHERE id=?",
+                      (name, content, enabled, _now(), sid))
+            return sid
+        cur = c.execute("INSERT INTO skills(name,content,enabled,created,updated) "
+                        "VALUES(?,?,?,?,?)", (name, content, enabled, _now(), _now()))
+        return cur.lastrowid
+
+
+def delete_skill(sid: int) -> None:
+    with connect() as c:
+        c.execute("DELETE FROM skills WHERE id=?", (sid,))
+
+
+def enabled_skills_text(per_skill_cap: int = 12000) -> str:
+    """Concatenate the ENABLED skills into one authoritative block for the scan
+    context. Each skill is capped so one huge doc can't blow the prompt; the full
+    text is always available in the UI."""
+    with connect() as c:
+        rows = [dict(r) for r in c.execute(
+            "SELECT name,content FROM skills WHERE enabled=1 ORDER BY name")]
+    rows = [r for r in rows if (r.get("content") or "").strip()]
+    if not rows:
+        return ""
+    parts = ["ENABLED ANALYSIS SKILLS — operator-provided playbooks/rules you MUST "
+             "apply on this scan (in addition to opt/workflow.md). Follow every one:"]
+    for r in rows:
+        body = (r["content"] or "").strip()
+        if len(body) > per_skill_cap:
+            body = body[:per_skill_cap] + "\n…(truncated — see the full skill in the UI)"
+        parts.append(f"\n===== SKILL: {r['name']} =====\n{body}")
+    return "\n".join(parts)
+
+
 def triage_context(repo_id: int) -> str:
-    """A prose block of the operator's prior triage decisions for a repo, injected into
-    the next scan's context so the agent stays consistent — above all, so it stops
-    re-reporting findings a human already dismissed as false positives."""
+    """A prose block of the operator's prior triage decisions AND comments for a repo,
+    injected into the next scan's context so the agent stays consistent — it stops
+    re-reporting findings a human dismissed, and it honors free-form comments (e.g.
+    'this id is a public UUID, safe to expose' / 'auth is enforced in the gateway')."""
     with connect() as c:
         rows = [dict(r) for r in c.execute(
             "SELECT severity,title,file,line,triage,triage_note FROM findings "
             "WHERE repo_id=? AND triage IS NOT NULL AND triage!='unset' "
             "ORDER BY triage, severity", (repo_id,))]
-    if not rows:
+        crows = [dict(r) for r in c.execute(
+            "SELECT f.severity AS severity, f.title AS title, f.file AS file, "
+            "f.line AS line, fc.body AS body FROM finding_comments fc "
+            "JOIN findings f ON f.uuid = fc.finding_uuid "
+            "WHERE f.repo_id=? ORDER BY f.id, fc.id", (repo_id,))]
+    if not rows and not crows:
         return ""
     dismissed = [r for r in rows if r["triage"] in TRIAGE_DISMISSED]
     confirmed = [r for r in rows if r["triage"] == "confirmed"]
 
+    def _where(r: dict) -> str:
+        w = (r.get("file") or "")
+        return w + (f":{r['line']}" if w and r.get("line") else "")
+
     def _line(r: dict) -> str:
-        where = (r.get("file") or "")
-        if where and r.get("line"):
-            where += f":{r['line']}"
         why = (r.get("triage_note") or "").strip()
+        w = _where(r)
         return (f"- [{TRIAGE_LABEL.get(r['triage'], r['triage'])}] "
                 f"{(r.get('severity') or '').upper()} {r.get('title') or '(untitled)'}"
-                + (f" ({where})" if where else "")
-                + (f" -- reason: {why}" if why else ""))
+                + (f" ({w})" if w else "") + (f" -- reason: {why}" if why else ""))
 
-    parts = ["PRIOR HUMAN TRIAGE for THIS repository (authoritative -- respect these "
-             "decisions and triage new findings consistently with them):"]
-    if dismissed:
-        parts.append("Already reviewed and DISMISSED -- do NOT re-report these as new "
-                     "issues; if you still see the same code, treat it as a known, "
-                     "accepted decision and do not raise it again:")
-        parts += [_line(r) for r in dismissed]
-    if confirmed:
-        parts.append("Previously CONFIRMED as real (still valid to report if present):")
-        parts += [_line(r) for r in confirmed]
+    parts: list[str] = []
+    if rows:
+        parts.append("PRIOR HUMAN TRIAGE for THIS repository (authoritative -- respect "
+                     "these decisions and triage new findings consistently with them):")
+        if dismissed:
+            parts.append("Already reviewed and DISMISSED -- do NOT re-report these as new "
+                         "issues; if you still see the same code, treat it as a known, "
+                         "accepted decision and do not raise it again:")
+            parts += [_line(r) for r in dismissed]
+        if confirmed:
+            parts.append("Previously CONFIRMED as real (still valid to report if present):")
+            parts += [_line(r) for r in confirmed]
+    if crows:
+        parts.append("OPERATOR COMMENTS on specific findings (authoritative guidance "
+                     "from the human reviewer -- honor them exactly: if a comment says "
+                     "an id/endpoint/finding is safe, intentional, or handled elsewhere, "
+                     "do NOT report it or anything equivalent):")
+        for r in crows:
+            body = (r.get("body") or "").strip()
+            if not body:
+                continue
+            w = _where(r)
+            parts.append(f"- on \"{r.get('title') or '(untitled)'}\""
+                         + (f" ({w})" if w else "") + f": {body}")
     parts.append("Apply the same reasoning to similar new findings before recording them.")
     return "\n".join(parts)
 

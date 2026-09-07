@@ -110,6 +110,9 @@ def _run_scan(repo_id: int, scan_id: int) -> None:
     # authoritative user context) so the agent triages consistently and stops
     # re-reporting findings a human already dismissed as false positives.
     ctx_parts = []
+    skills = db.enabled_skills_text()          # operator-uploaded .md playbooks
+    if skills:
+        ctx_parts.append(skills)
     if (repo.get("context") or "").strip():
         ctx_parts.append(repo["context"].strip())
     triage_ctx = db.triage_context(repo_id)

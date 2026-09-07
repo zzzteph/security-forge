@@ -229,6 +229,43 @@ async def put_settings(request: Request, user: str = Depends(require_user)):
     return {"ok": True, "max_concurrent_scans": n}
 
 
+# --- skills (operator .md playbooks injected into every scan) ---------------
+
+@app.get("/api/skills")
+def skills(user: str = Depends(require_user)):
+    return {"skills": db.list_skills()}
+
+
+@app.get("/api/skills/{sid}")
+def skill_detail(sid: int, user: str = Depends(require_user)):
+    s = db.get_skill(sid)
+    if not s:
+        raise HTTPException(404, "no such skill")
+    return s
+
+
+@app.post("/api/skills")
+async def create_skill(request: Request, user: str = Depends(require_user)):
+    body = await request.json()
+    if not (body.get("name") or "").strip():
+        raise HTTPException(400, "name required")
+    return {"ok": True, "id": db.upsert_skill(body)}
+
+
+@app.put("/api/skills/{sid}")
+async def update_skill(sid: int, request: Request, user: str = Depends(require_user)):
+    if not db.get_skill(sid):
+        raise HTTPException(404, "no such skill")
+    db.upsert_skill(await request.json(), sid)
+    return {"ok": True}
+
+
+@app.delete("/api/skills/{sid}")
+def remove_skill(sid: int, user: str = Depends(require_user)):
+    db.delete_skill(sid)
+    return {"ok": True}
+
+
 # --- repos ------------------------------------------------------------------
 
 @app.get("/api/repos")

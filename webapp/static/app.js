@@ -17,6 +17,7 @@ createApp({
       commentDraft: '', triageMsg: '', hideFP: false,
       repos: [], runner: { running: null, queued: 0 },
       backends: [], backendsHome: '/data/home', authModal: null,
+      skills: [], skillForm: null, skillErr: '',
       settings: { defaults: { backend: 'litellm', model: '', base_url: '', max_turns: '',
         temperature: '', timeout: '', agent_cmd: '', agent_output: '', extra_args: '', env: [] },
         max_concurrent_scans: 1 },
@@ -80,6 +81,7 @@ createApp({
       if (view === 'repos') this.loadRepos();
       if (view === 'findings') this.loadFindings();
       if (view === 'scans') this.loadScans();
+      if (view === 'skills') this.loadSkills();
       if (view === 'backends') this.loadBackends();
       if (view === 'settings') { this.loadSettings(); this.loadBackends(); }
       if (!skipHash) this.pushHash('#/' + view);
@@ -93,7 +95,7 @@ createApp({
       const i = raw.indexOf('/');
       const seg = i < 0 ? raw : raw.slice(0, i);
       const id = i < 0 ? '' : raw.slice(i + 1);
-      const views = ['dashboard', 'repos', 'findings', 'scans', 'backends', 'settings'];
+      const views = ['dashboard', 'repos', 'findings', 'scans', 'skills', 'backends', 'settings'];
       if (!seg || views.includes(seg)) return this.go(seg || 'dashboard', true);
       if (seg === 'finding' && id) { this.current = null; this.scanView = null; this.view = 'finding'; return this.openFinding({ uuid: id }, true); }
       if (seg === 'repo' && id) return this.openRepo({ id: +id }, true);
@@ -137,6 +139,41 @@ createApp({
     },
     addEnv(list) { list.push({ key: '', value: '', _show: true }); },
     rmEnv(list, i) { list.splice(i, 1); },
+
+    // Skills — operator .md playbooks injected into every scan
+    async loadSkills() { this.skills = (await this.api('GET', '/api/skills')).skills; },
+    newSkill() { this.skillErr = ''; this.skillForm = { name: '', content: '', enabled: true }; },
+    async editSkill(s) {
+      this.skillErr = '';
+      this.skillForm = await this.api('GET', '/api/skills/' + s.id);
+    },
+    async saveSkill() {
+      this.skillErr = '';
+      if (!(this.skillForm.name || '').trim()) { this.skillErr = 'Name required'; return; }
+      try {
+        if (this.skillForm.id) await this.api('PUT', '/api/skills/' + this.skillForm.id, this.skillForm);
+        else await this.api('POST', '/api/skills', this.skillForm);
+        this.skillForm = null; await this.loadSkills();
+      } catch (e) { this.skillErr = String(e.message || e); }
+    },
+    async toggleSkill(s) {
+      await this.api('PUT', '/api/skills/' + s.id, { name: s.name, enabled: !s.enabled });
+      await this.loadSkills();
+    },
+    async deleteSkill(s) {
+      if (!confirm('Delete skill "' + s.name + '"?')) return;
+      await this.api('DELETE', '/api/skills/' + s.id); await this.loadSkills();
+    },
+    uploadSkill(ev) {
+      const f = ev.target.files && ev.target.files[0];
+      if (!f) return;
+      const rd = new FileReader();
+      rd.onload = () => {
+        this.skillForm.content = rd.result;
+        if (!this.skillForm.name) this.skillForm.name = f.name.replace(/\.md$/i, '');
+      };
+      rd.readAsText(f);
+    },
 
     // in-browser authorization terminal (xterm.js <-> PTY over WebSocket)
     canAuth(b) { return b.available && ['claude-code', 'codex', 'gemini'].includes(b.name); },
@@ -412,6 +449,7 @@ createApp({
       <a :class="{on:view=='repos'||view=='repo'}" @click="go('repos')">Repositories</a>
       <a :class="{on:view=='findings'||view=='finding'}" @click="go('findings')">Findings</a>
       <a :class="{on:view=='scans'}" @click="go('scans')">Scans</a>
+      <a :class="{on:view=='skills'}" @click="go('skills')">Skills</a>
       <a :class="{on:view=='backends'}" @click="go('backends')">Backends</a>
       <a :class="{on:view=='settings'}" @click="go('settings')">Settings</a>
       <a class="signout" @click="logout">Sign out</a>
@@ -658,6 +696,26 @@ createApp({
       </div>
     </div>
 
+    <!-- SKILLS -->
+    <div v-if="view=='skills'">
+      <div class="flex" style="margin-bottom:10px"><span class="muted" style="font-size:12px">Enabled skills are appended to every scan as authoritative playbooks/rules the agent must follow (in addition to the built-in workflow).</span><span class="spacer"></span><button class="primary" @click="newSkill">+ Add skill</button></div>
+      <div class="card"><table>
+        <thead><tr>
+          <th @click="toggleSort('skills','name')" style="cursor:pointer">Skill{{caret('skills','name')}}</th>
+          <th @click="toggleSort('skills','enabled')" style="cursor:pointer">Enabled{{caret('skills','enabled')}}</th>
+          <th @click="toggleSort('skills','size')" style="cursor:pointer">Size{{caret('skills','size')}}</th>
+          <th @click="toggleSort('skills','updated')" style="cursor:pointer">Updated{{caret('skills','updated')}}</th><th></th></tr></thead>
+        <tbody>
+          <tr v-for="s in sortRows(skills,'skills')" :key="s.id">
+            <td><a @click="editSkill(s)">{{s.name}}</a></td>
+            <td><button class="sm" @click="toggleSkill(s)"><span class="dot" :class="s.enabled?'on':'off'"></span>{{s.enabled?'enabled':'disabled'}}</button></td>
+            <td class="muted">{{s.size}} B</td>
+            <td class="muted nowrap">{{fmt(s.updated)}}</td>
+            <td class="nowrap right"><button class="sm" @click="editSkill(s)">Edit</button><button class="sm danger" @click="deleteSkill(s)">✕</button></td></tr>
+          <tr v-if="!skills.length"><td colspan="5" class="muted">No skills yet. Add one to extend how the agent scans (e.g. custom rules, org conventions, extra methodology).</td></tr>
+        </tbody></table></div>
+    </div>
+
     <!-- BACKENDS -->
     <div v-if="view=='backends'">
       <div class="card"><h2>Available backends / tools</h2><table>
@@ -749,6 +807,20 @@ createApp({
   <div class="right flex" style="margin-top:14px;justify-content:flex-end">
     <button @click="editing=null;repoForm=null">Cancel</button>
     <button class="primary" @click="saveRepo">Save</button></div>
+</div></div>
+
+<!-- SKILL EDIT MODAL -->
+<div v-if="skillForm" class="modal-bg"><div class="modal" style="width:min(720px,95vw)">
+  <h2 style="margin-top:0">{{skillForm.id?'Edit skill':'Add skill'}}</h2>
+  <div class="row"><div><label>Name</label><input v-model="skillForm.name" placeholder="e.g. Our auth conventions"></div>
+    <div style="flex:0 0 auto"><label>Upload .md</label><input type="file" accept=".md,.markdown,.txt" @change="uploadSkill"></div></div>
+  <label>Markdown — rules / playbook the agent must follow</label>
+  <textarea v-model="skillForm.content" style="min-height:260px" class="mono" placeholder="# Our conventions&#10;- IDs are ULIDs — treat as non-enumerable.&#10;- AuthZ is enforced in middleware/Guard.php; handlers may assume the caller is authorized.&#10;- Flag any use of the deprecated crypto/legacy.php."></textarea>
+  <label class="flex" style="margin-top:10px"><input type="checkbox" style="width:auto" v-model="skillForm.enabled"> <span>Enabled (injected into every scan)</span></label>
+  <div class="err" v-if="skillErr">{{skillErr}}</div>
+  <div class="right flex" style="margin-top:14px;justify-content:flex-end">
+    <button @click="skillForm=null">Cancel</button>
+    <button class="primary" @click="saveSkill">Save</button></div>
 </div></div>
 
 <!-- SCAN LOG MODAL -->
