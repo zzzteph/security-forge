@@ -430,7 +430,7 @@ createApp({
           <td><span class="badge" :class="'b-'+f.severity">{{f.severity}}</span></td>
           <td class="muted">{{f.slug}}</td>
           <td>{{f.title}}<span v-if="f.triage && f.triage!=='unset'" class="tri" :class="'tri-'+f.triage">{{triageShort(f.triage)}}</span></td>
-          <td class="mono muted">{{f.file}}{{f.line?':'+f.line:''}}</td></tr>
+          <td class="mono muted where">{{f.file}}{{f.line?':'+f.line:''}}</td></tr>
           <tr v-if="!dashFindings.length"><td colspan="4" class="muted">{{hideFP && findings.length ? 'All open findings are marked false positive.' : 'No open findings.'}}</td></tr></tbody></table>
       </div>
     </div>
@@ -480,7 +480,7 @@ createApp({
           <th @click="toggleSort('rfind','status')" style="cursor:pointer">Status{{caret('rfind','status')}}</th></tr></thead>
         <tbody><tr v-for="f in sortRows(current.findings,'rfind')" :key="f.id" style="cursor:pointer" @click="openFinding(f); view='finding'">
           <td><span class="badge" :class="'b-'+f.severity">{{f.severity}}</span></td>
-          <td>{{f.title}}</td><td class="mono muted">{{f.file}}{{f.line?':'+f.line:''}}</td>
+          <td>{{f.title}}</td><td class="mono muted where">{{f.file}}{{f.line?':'+f.line:''}}</td>
           <td><span class="pill" :class="f.status">{{f.status}}</span></td></tr>
           <tr v-if="!current.findings.length"><td colspan="4" class="muted">No findings recorded yet.</td></tr></tbody></table></div>
       <div class="card"><h2>Scan history</h2><table>
@@ -526,7 +526,7 @@ createApp({
         <tbody><tr v-for="f in sortRows(triageFiltered(findings),'findings')" :key="f.id" style="cursor:pointer" @click="openFinding(f); view='finding'">
           <td><span class="badge" :class="'b-'+f.severity">{{f.severity}}</span></td>
           <td class="muted">{{f.slug}}</td><td>{{f.title}}</td>
-          <td class="mono muted">{{f.file}}{{f.line?':'+f.line:''}}</td>
+          <td class="mono muted where">{{f.file}}{{f.line?':'+f.line:''}}</td>
           <td><span class="stwrap"><span class="pill" :class="f.status">{{f.status}}</span>
             <span v-if="f.triage && f.triage!=='unset'" class="tri" :class="'tri-'+f.triage">{{triageShort(f.triage)}}</span></span></td>
           <td class="muted nowrap">{{fmt(f.last_seen)}}</td></tr>
@@ -703,7 +703,7 @@ createApp({
     <table><thead><tr><th>Sev</th><th>Title</th><th>Where</th><th>Status</th></tr></thead>
       <tbody><tr v-for="f in scanView.findings" :key="f.uuid||f.id" style="cursor:pointer" @click="openFindingFromScan(f)">
         <td><span class="badge" :class="'b-'+f.severity">{{f.severity}}</span></td>
-        <td>{{f.title}}</td><td class="mono muted">{{f.file}}{{f.line?':'+f.line:''}}</td>
+        <td>{{f.title}}</td><td class="mono muted where">{{f.file}}{{f.line?':'+f.line:''}}</td>
         <td><span class="stwrap"><span class="pill" :class="f.status">{{f.status}}</span>
           <span v-if="f.triage && f.triage!=='unset'" class="tri" :class="'tri-'+f.triage">{{triageShort(f.triage)}}</span></span></td></tr></tbody></table>
   </div>
