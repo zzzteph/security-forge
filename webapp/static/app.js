@@ -57,7 +57,7 @@ createApp({
         this.me = { username: d.username, must_change: d.must_change };
         this.login.password = '';
         if (d.must_change) this.pw.show = true;
-        this.go('dashboard');
+        this.applyRoute();   // honor a shared #/finding/... link that sent them to login
       } catch (e) { this.login.err = String(e.message || e); }
     },
     async logout() { await this.api('POST', '/api/logout'); this.me = null; },
@@ -69,7 +69,7 @@ createApp({
         this.me.must_change = false; setTimeout(() => (this.pw.show = false), 800);
       } catch (e) { this.pw.err = String(e.message || e); }
     },
-    go(view) {
+    go(view, skipHash) {
       this.view = view; this.finding = null; this.current = null; this.scanView = null;
       this.menuOpen = false;
       if (view === 'dashboard') this.loadDashboard();
@@ -78,6 +78,23 @@ createApp({
       if (view === 'scans') this.loadScans();
       if (view === 'backends') this.loadBackends();
       if (view === 'settings') { this.loadSettings(); this.loadBackends(); }
+      if (!skipHash) this.pushHash('#/' + view);
+    },
+    // --- shareable URLs: every view/entity maps to a hash the browser can bookmark ---
+    pushHash(h) { if (location.hash !== h) { this._suppress = true; location.hash = h; } },
+    onHashChange() { if (this._suppress) { this._suppress = false; return; } this.applyRoute(); },
+    applyRoute() {
+      if (!this.me) return;
+      const raw = (location.hash || '').replace(/^#\/?/, '');
+      const i = raw.indexOf('/');
+      const seg = i < 0 ? raw : raw.slice(0, i);
+      const id = i < 0 ? '' : raw.slice(i + 1);
+      const views = ['dashboard', 'repos', 'findings', 'scans', 'backends', 'settings'];
+      if (!seg || views.includes(seg)) return this.go(seg || 'dashboard', true);
+      if (seg === 'finding' && id) { this.current = null; this.scanView = null; this.view = 'finding'; return this.openFinding({ uuid: id }, true); }
+      if (seg === 'repo' && id) return this.openRepo({ id: +id }, true);
+      if (seg === 'scan' && id) { this.go('scans', true); return this.openScan({ id: +id }, true); }
+      this.go('dashboard', true);
     },
     async loadDashboard() {
       const d = await this.api('GET', '/api/findings?status=open');
@@ -175,11 +192,13 @@ createApp({
     },
     async runScan(r) { await this.api('POST', '/api/repos/' + r.id + '/scan'); await this.loadRepos(); this.go('scans'); },
 
-    async openRepo(r) {
+    async openRepo(r, skipHash) {
       const d = await this.api('GET', '/api/repos/' + r.id);
-      this.current = d; this.view = 'repo'; this.finding = null;
+      this.current = d; this.view = 'repo'; this.finding = null; this.scanView = null;
+      if (!skipHash) this.pushHash('#/repo/' + r.id);
     },
-    async openFinding(f) {
+    async openFinding(f, skipHash) {
+      this.view = 'finding';
       const d = await this.api('GET', '/api/findings/' + encodeURIComponent(f.uuid || f.id));
       this.finding = d.finding;
       this.finding._md = d.advisory_markdown;
@@ -187,6 +206,7 @@ createApp({
       this.finding._triageValues = d.triage_values || Object.keys(TRIAGE_LABELS);
       this.finding._triageLabels = d.triage_labels || TRIAGE_LABELS;
       this.commentDraft = ''; this.triageMsg = '';
+      if (!skipHash) this.pushHash('#/finding/' + (this.finding.uuid || f.uuid || f.id));
     },
     async saveTriage() {
       await this.api('PUT', '/api/findings/' + encodeURIComponent(this.finding.uuid) + '/triage',
@@ -212,13 +232,15 @@ createApp({
     async loadScans() {
       const d = await this.api('GET', '/api/scans'); this.scans = d.scans; this.runner = d.runner;
     },
-    async openScan(s) {
+    async openScan(s, skipHash) {
       const el = this.$refs.logEl;
       // remember whether the user is pinned to the bottom BEFORE we replace content
       const atBottom = !el || (el.scrollHeight - el.scrollTop - el.clientHeight < 40);
       this.scanView = await this.api('GET', '/api/scans/' + s.id);
+      if (!skipHash) this.pushHash('#/scan/' + s.id);
       if (atBottom) this.$nextTick(() => { const e = this.$refs.logEl; if (e) e.scrollTop = e.scrollHeight; });
     },
+    closeScan() { this.scanView = null; this.pushHash('#/' + (this.view || 'scans')); },
     async relaunchScan(s) {
       const d = await this.api('POST', '/api/scans/' + s.id + '/relaunch');
       await this.loadScans();
@@ -319,7 +341,8 @@ createApp({
     },
   },
   async mounted() {
-    try { this.me = await this.api('GET', '/api/me'); if (this.me.must_change) this.pw.show = true; this.go('dashboard'); }
+    window.addEventListener('hashchange', () => this.onHashChange());
+    try { this.me = await this.api('GET', '/api/me'); if (this.me.must_change) this.pw.show = true; this.applyRoute(); }
     catch (e) { this.me = null; }
     this.ready = true;
     this.scheduleTick();
@@ -501,8 +524,8 @@ createApp({
           <td><span class="badge" :class="'b-'+f.severity">{{f.severity}}</span></td>
           <td class="muted">{{f.slug}}</td><td>{{f.title}}</td>
           <td class="mono muted">{{f.file}}{{f.line?':'+f.line:''}}</td>
-          <td><span class="pill" :class="f.status">{{f.status}}</span>
-            <span v-if="f.triage && f.triage!=='unset'" class="tri" :class="'tri-'+f.triage">{{triageShort(f.triage)}}</span></td>
+          <td><span class="stwrap"><span class="pill" :class="f.status">{{f.status}}</span>
+            <span v-if="f.triage && f.triage!=='unset'" class="tri" :class="'tri-'+f.triage">{{triageShort(f.triage)}}</span></span></td>
           <td class="muted nowrap">{{fmt(f.last_seen)}}</td></tr>
           <tr v-if="!triageFiltered(findings).length"><td colspan="6" class="muted">No findings.</td></tr></tbody></table></div>
     </div>
@@ -666,7 +689,7 @@ createApp({
     <span class="pill" :class="scanView.status"><span v-if="isLive(scanView)" class="dot pulse on"></span>{{scanView.status}}</span>
     <button class="sm" @click="relaunchScan(scanView)">Relaunch</button>
     <button class="sm danger" :disabled="isLive(scanView)" @click="deleteScan(scanView)">Delete</button>
-    <button class="sm" @click="scanView=null">close</button></div>
+    <button class="sm" @click="closeScan()">close</button></div>
   <div class="muted" style="font-size:12px;margin:6px 0">
     <span v-if="scanView.status==='running'" class="live">{{heartbeatText(scanView)}}</span>
     <span v-else>{{scanView.new_count}} new · {{scanView.mitigated_count}} mitigated · {{scanView.total_count}} open · {{money(scanView.cost_usd)}} spent · commit {{(scanView.commit_sha||'').slice(0,8)}}</span>
@@ -678,8 +701,8 @@ createApp({
       <tbody><tr v-for="f in scanView.findings" :key="f.uuid||f.id" style="cursor:pointer" @click="openFindingFromScan(f)">
         <td><span class="badge" :class="'b-'+f.severity">{{f.severity}}</span></td>
         <td>{{f.title}}</td><td class="mono muted">{{f.file}}{{f.line?':'+f.line:''}}</td>
-        <td><span class="pill" :class="f.status">{{f.status}}</span>
-          <span v-if="f.triage && f.triage!=='unset'" class="tri" :class="'tri-'+f.triage">{{triageShort(f.triage)}}</span></td></tr></tbody></table>
+        <td><span class="stwrap"><span class="pill" :class="f.status">{{f.status}}</span>
+          <span v-if="f.triage && f.triage!=='unset'" class="tri" :class="'tri-'+f.triage">{{triageShort(f.triage)}}</span></span></td></tr></tbody></table>
   </div>
   <h2 style="margin:14px 0 6px">Log</h2>
   <pre class="log" ref="logEl">{{scanView.log||'(no output yet)'}}</pre>

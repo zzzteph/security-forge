@@ -59,7 +59,10 @@ tr:hover td{background:var(--panel2)}
 
 /* triage disposition chips (on findings) */
 .tri{display:inline-block;margin-left:6px;padding:2px 9px;border-radius:20px;font-size:12px;
-  border:1px solid var(--line);color:var(--muted);vertical-align:middle}
+  border:1px solid var(--line);color:var(--muted);vertical-align:middle;white-space:nowrap}
+/* status pill + triage chip share one cell: lay them out so they never collide */
+.stwrap{display:inline-flex;gap:6px;align-items:center;flex-wrap:wrap}
+.stwrap .tri{margin-left:0}
 .tri-confirmed{color:#ff9a9d;border-color:var(--crit)}
 .tri-false_positive{color:var(--ok);border-color:var(--ok)}
 .tri-accepted_risk,.tri-wont_fix{color:var(--med);border-color:var(--med)}
