@@ -1,0 +1,9 @@
+# security-forge UI (web control plane) dependencies.
+fastapi>=0.110
+uvicorn[standard]>=0.27
+apscheduler>=3.10
+weasyprint>=60          # advisory / executive-report PDF export
+markdown>=3.5           # advisory markdown -> HTML for PDF
+python-multipart>=0.0.9 # login form posts
+itsdangerous>=2.1       # signed session cookie
+litellm>=1.40           # default (CLI-free) scan backend
