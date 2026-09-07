@@ -30,9 +30,17 @@ Do NOT tear down at the end — the orchestrator calls `nuke` after collecting
 results (verifiers may share the instance).
 
 ## Method
-1. **Get it running.** Prefer the repo's own `docker-compose` (build+up); else
-   build the Dockerfile; else craft a minimal one from the model's boot info
-   (deps, env, port). Read README/Dockerfile/compose for env, ports, seed data,
+1. **Get the REAL app running — never a library harness.** What you run MUST be the
+   actual application, reachable over its real entry point. Prefer the repo's own
+   `docker-compose` (build+up); else build the Dockerfile; else craft a minimal
+   deployment **of the real app** from the model's boot info (deps, env, port). Do
+   NOT build a standalone harness that calls the vulnerable dependency directly
+   (e.g. a Maven/JUnit program invoking SAXBuilder/XmlRpc/the parser) — that only
+   proves the library's behaviour, not that this app is exploitable, and never
+   counts as `verified`. Slow builds are not an excuse to substitute a harness:
+   there is no time budget for verification, so build the real thing; if you truly
+   cannot boot the real app, return `could_not_run` (never `verified`). Read
+   README/Dockerfile/compose for env, ports, seed data,
    default creds. Poll `probe` until it answers or the boot timeout passes.
 2. **Baseline.** Confirm the endpoint exists and how it behaves normally.
 3. **Instrument the path (the debug-string technique).** This is how you *see*

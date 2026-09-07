@@ -36,7 +36,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          # -> ghcr.io/<owner>/<repo>  (lowercased automatically)
+          # ONE image, run as CLI or UI -> ghcr.io/<owner>/<repo> (lowercased)
           images: ghcr.io/${{ github.repository }}
           tags: |
             # Release tags: pushing git tag v1.2.3 publishes image tags 1.2.3, 1.2, 1.
@@ -58,6 +58,6 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # Speed up repeat builds (the Node/Claude + apt layers are the slow part).
+          # Speed up repeat builds (the Node/agents + apt layers are the slow part).
           cache-from: type=gha
           cache-to: type=gha,mode=max

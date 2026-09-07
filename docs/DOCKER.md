@@ -1,10 +1,15 @@
 # Running security-forge in Docker
 
-security-forge is packaged as a container image that bundles the pipeline with
-Python, `git`, `ripgrep`, and the Docker CLI + compose plugin. The one thing to
-understand up front: **security-forge runs Docker itself** — its verification step
-builds and runs the target application in throwaway containers to prove a finding
-is real. So the container needs access to a Docker daemon.
+**One image, run as CLI or UI.** The `security-forge` image bundles the pipeline
+(Python, `git`, `ripgrep`), the web UI, and the agent CLIs. The entrypoint
+dispatches:
+
+- `… security-forge ui` → the **web UI** (uvicorn on :8000).
+- `… security-forge <orchestrator args>` → the **CLI** orchestrator.
+
+It does **static analysis only** — `--verify` builds and runs the target, which
+needs a Docker daemon (Docker-in-Docker), so run verification on a host directly,
+not in the container.
 
 ## Image
 
@@ -43,56 +48,44 @@ Build it yourself instead:
 
 ```bash
 docker build -t security-forge .
-# lean image without Node/Claude Code (uses the litellm backend):
-docker build --build-arg INSTALL_CLAUDE=false -t security-forge .
+# lean image without the Node agent CLIs (uses the native litellm backend):
+docker build --build-arg INSTALL_AGENTS=false -t security-forge .
 ```
 
-## Giving the container a Docker daemon (Docker-out-of-Docker)
+## The container does STATIC analysis only — no verification
 
-The simplest, reliable setup on a **Linux host** (mount the host's Docker socket
-and share its network):
+Verification builds and runs the target app in throwaway containers, which means
+the tool needs to *drive a Docker daemon*. Doing that from **inside** a container
+requires Docker-in-Docker (a privileged nested daemon), which we don't want. So:
+
+> **`--verify` is not supported in the container.** The image runs static analysis
+> — it maps the code, finds and reports vulnerabilities, and writes advisories, but
+> does not stand the target up to reproduce a PoC.
+
+Run it as static analysis (no socket, no host networking):
 
 ```bash
 docker run --rm -it \
-  --network host \
-  -v /var/run/docker.sock:/var/run/docker.sock \
   -v "$PWD/sf-data:/data" \
-  -e ANTHROPIC_API_KEY=sk-... \
-  ghcr.io/zzzteph/security-forge:latest --path /data/mysrc --model opus4.8
+  -e OPENAI_API_KEY=sk-... \
+  ghcr.io/zzzteph/security-forge:latest --path /data/mysrc --backend litellm --model openai/gpt-5
 ```
 
-Why each flag:
+`-v "$PWD/sf-data:/data"` persists everything (`db/`, `knowledge/`, `reports/`,
+`logs/`); put source to analyze there and point `--path /data/<folder>` at it.
 
-- **`-v /var/run/docker.sock:/var/run/docker.sock`** — the verifier's
-  `docker build/run/compose` commands drive the *host* daemon. The sandbox
-  containers run as siblings on the host (namespaced `security-forge_*` and torn
-  down after each run).
-- **`--network host`** (Linux) — the sandbox publishes ports on `127.0.0.1` and
-  the verifier probes `127.0.0.1`; host networking makes those the *same*
-  loopback, so verification and the `verify-poc` gate work. Without it the probes
-  can't reach the sibling containers.
-- **`-v "$PWD/sf-data:/data"`** — all results (`db/`, `knowledge/`, `reports/`,
-  `logs/`) persist here (`SECFORGE_DATA_DIR=/data` is baked in). Put local source
-  you want to analyze here too and point `--path /data/<folder>` at it.
+### Want verification (reproduced PoCs)? Run on a host, not in a container
 
-> **macOS / Windows (Docker Desktop):** `--network host` doesn't bridge to the VM
-> the same way. The socket mount still works, but the loopback-probe step may not
-> line up — prefer running the image on a Linux host/VM for the verification step.
-
-### Stronger isolation (Docker-in-Docker)
-
-If you'd rather not expose the host daemon, run a `dind` daemon and point the
-image at it (heavier, needs `--privileged`):
+Verification is a **host workflow**: run the orchestrator directly on a machine
+that has Docker, so it can build/run targets on that daemon:
 
 ```bash
-docker network create sf
-docker run -d --privileged --name sf-dind --network sf \
-  -e DOCKER_TLS_CERTDIR= docker:dind --host=tcp://0.0.0.0:2375
-docker run --rm -it --network sf \
-  -e DOCKER_HOST=tcp://sf-dind:2375 \
-  -v "$PWD/sf-data:/data" -e ANTHROPIC_API_KEY=sk-... \
-  ghcr.io/zzzteph/security-forge:latest --path /data/mysrc --model opus4.8
+# on a Docker host (bare metal / VM), from a checkout of this repo:
+python orchestrate.py --repo https://github.com/OWNER/REPO --verify --model opus4.8
 ```
+
+That's the only supported path for `--verify`; the container image and the web UI
+are static-only by design.
 
 ## Picking a backend + keys
 
@@ -121,16 +114,12 @@ ANTHROPIC_API_KEY=sk-... docker compose run --rm security-forge \
 
 ```bash
 # whole org, native LiteLLM backend, results + reports persisted in ./sf-data
-docker run --rm -it --network host \
-  -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD/sf-data:/data" \
-  -e OPENAI_API_KEY=sk-... \
+docker run --rm -it -v "$PWD/sf-data:/data" -e OPENAI_API_KEY=sk-... \
   ghcr.io/zzzteph/security-forge:latest --org OWNER --backend litellm --model openai/gpt-5
 
 # re-check only the repos you've already analyzed (no org discovery)
-docker run --rm -it --network host \
-  -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD/sf-data:/data" \
-  -e ANTHROPIC_API_KEY=sk-... \
-  ghcr.io/zzzteph/security-forge:latest --known-only --model opus4.8
+docker run --rm -it -v "$PWD/sf-data:/data" -e OPENAI_API_KEY=sk-... \
+  ghcr.io/zzzteph/security-forge:latest --known-only --backend litellm --model openai/gpt-5
 
 # browse everything found, across all projects
 cat sf-data/reports/INDEX.txt
@@ -141,11 +130,7 @@ docker run --rm -it --entrypoint bash ghcr.io/zzzteph/security-forge:latest
 
 ## Notes & limits
 
-- The container runs as **root** so it can use the mounted Docker socket. Treat the
-  host as the blast radius (it runs untrusted target code in sibling containers) —
-  run it on a machine you're willing to treat that way, keep Docker updated.
-- A target that ships a `docker-compose.yml` using **host bind mounts** may not
-  verify cleanly under DooD (its paths resolve on the host daemon, not inside this
-  container). security-forge's own sandbox avoids bind mounts.
+- **Static only** — no `--verify` in the container (that needs a Docker daemon and
+  would require Docker-in-Docker). Verify on a host instead (see above).
 - Everything the pipeline needs (`opt/`, `sast/`, `docs/`, `.claude/agents/`) is in
   the image; only your data/logs/secrets are excluded (`.dockerignore`).

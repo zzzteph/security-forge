@@ -167,25 +167,31 @@ def build_prompt(repo_url: str, slug: str, timeout: int, verify: bool = False) -
                  f"you have. Your turn MUST NOT end until record has run. (No nuke — no sandbox.)")
     if verify:
         verify_block = (
-            "(3b) VERIFY + FULL DELIVERABLES for EVERY HIGH/CRITICAL — MANDATORY THIS "
-            "RUN, for THIS repo only. For each HIGH and CRITICAL finding you record, "
-            "produce ALL THREE, never one without the others: "
-            "(a) a self-contained runnable PoC BUNDLE in <knowledge_dir>/poc/<NN>-<slug>/ "
-            "— a docker-compose.yml that boots the vulnerable target, a poc.py that "
-            "fires the exploit and prints `EXPLOITED ✓` / exits 0 on success (non-zero "
-            "on failure), plus a short README; "
-            "(b) run `python scripts/pipeline.py verify-poc <id> --dir <bundle>` and "
-            "confirm it exits 0 — this is what flips the finding to `verified`; a "
-            "bundle that does not reproduce means it is NOT verified (fix it or drop "
-            "the finding); "
-            "(c) a GHSA-style ADVISORY at <knowledge_dir>/advisories/GHSA-<NN>-<slug>.md "
-            "(summary, affected version, root cause with file:line, PoC, impact, "
-            "remediation, CVSS), linked with `python scripts/pipeline.py set-status "
-            "<id> --advisory-path <file>`. "
-            "So every verified HIGH/CRITICAL ends with a reproduced Docker PoC bundle AND "
-            "an advisory. Do NOT skip any of this to save time, and do NOT verify or "
-            "write deliverables for any other repo. MEDIUM findings stay static — no "
-            "bundle, no advisory. ")
+            "(3b) VERIFY BY EXPLOITING THE REAL RUNNING APP — MANDATORY THIS RUN, for "
+            "THIS repo only. 'Verified' means the ACTUAL application is built, booted, "
+            "and exploited END TO END over its real attacker-facing entry point (the "
+            "HTTP route / API / file upload / etc. from the model) and you observe the "
+            "real effect. A library/unit HARNESS that only drives the vulnerable "
+            "dependency in isolation (e.g. a Maven/JUnit program that calls "
+            "SAXBuilder / XmlRpc / the parser directly) is NOT verification and NEVER "
+            "counts as verified — it is worthless as a PoC. There is NO time limit this "
+            "run, so BUILD THE REAL TARGET (its own Dockerfile/compose, or one built "
+            "from its build system) — never substitute a harness or skip the build to "
+            "save time. For each HIGH/CRITICAL finding, produce ALL THREE: "
+            "(a) a PoC BUNDLE in <knowledge_dir>/poc/<NN>-<slug>/ whose docker-compose.yml "
+            "BOOTS THE REAL APP and whose poc.py sends the exploit to the running app's "
+            "real endpoint and confirms the real effect (prints `EXPLOITED ✓`, exits 0; "
+            "non-zero on failure); "
+            "(b) run `python scripts/pipeline.py verify-poc <id> --dir <bundle>` — it "
+            "must exit 0 against that real app; "
+            "(c) a GHSA advisory at <knowledge_dir>/advisories/GHSA-<NN>-<slug>.md whose "
+            "PoC section is that end-to-end request against the running app, linked with "
+            "`python scripts/pipeline.py set-status <id> --advisory-path <file>`. "
+            "If, after a genuine effort with the real build, you CANNOT stand the app up, "
+            "mark the finding `triaged` with the concrete blocker — do NOT mark it "
+            "verified, do NOT write an advisory claiming runtime proof, and do NOT ship a "
+            "harness as the PoC. Do not verify or write deliverables for any other repo. "
+            "MEDIUM findings stay static — no bundle, no advisory. ")
     else:
         verify_block = ""
     return (
@@ -198,6 +204,10 @@ def build_prompt(repo_url: str, slug: str, timeout: int, verify: bool = False) -
         f"end for THIS repo only: read the prepped tree + `python scripts/pipeline.py "
         f"shape` and any knowledge/ model, hunt for real MEDIUM/HIGH/CRITICAL bugs, "
         f"{hunt}{tail}"
+        + (("USER-PROVIDED CONTEXT for THIS repo (authoritative — obey it): "
+            + os.environ.get("SECFORGE_EXTRA_CONTEXT", "").strip() + " ")
+           if os.environ.get("SECFORGE_EXTRA_CONTEXT", "").strip() else "")
+        +
         f"Do NOT analyze any other repo, do NOT loop to a next repo, never "
         f"ask questions, keep everything local (notify-only). Stop as soon as this "
         f"one repo is recorded. "
