@@ -89,12 +89,32 @@ def _token_for(host: str) -> str:
     return _git_credential_token(host)
 
 
+def _normalize_url(url: str) -> str:
+    """Accept a scheme-less 'host.tld/org/repo' and turn it into a real https URL, so
+    `--repo github.example.com/org/repo` works without the user typing https://. Leaves
+    real schemes (https/http/ssh/git://), scp-style git@host:org/repo, and local paths."""
+    s = (url or "").strip()
+    if not s:
+        return s
+    low = s.lower()
+    if low.startswith(("https://", "http://", "ssh://", "git://", "file://")):
+        return s
+    head = s.split("/", 1)[0]
+    if s.startswith("git@") or ("@" in head and ":" in head):   # scp-style ssh
+        return s
+    if s.startswith(("/", "~", ".")) or re.match(r"^[A-Za-z]:[\\/]", s):  # local path
+        return s
+    if "/" in s and "." in head:                                # bare host.tld/org/repo
+        return "https://" + s
+    return s
+
+
 def _authed_url(url: str) -> str:
     """Inject a token into an https clone URL for private repos. Leaves URLs that
     already carry credentials, ssh URLs, and token-less hosts untouched. The
     clone is disposable and nuked after each session, so the credential living in
     .git/config for its lifetime is acceptable."""
-    s = (url or "").strip()
+    s = _normalize_url(url)
     if not s.startswith("https://") or "@" in s.split("://", 1)[1].split("/", 1)[0]:
         return s
     tok = _token_for(_host_of(s))
@@ -278,7 +298,7 @@ def _prep_local(url: str, branch: str | None, depth, prev: str | None) -> dict:
 
 def clone_or_update(cfg: dict) -> dict:
     target = cfg.get("target", {}) or {}
-    url = target_repo(cfg)   # SECFORGE_TARGET_REPO env overrides config.yaml
+    url = _normalize_url(target_repo(cfg))   # SECFORGE_TARGET_REPO env overrides config.yaml
     branch = (target.get("branch") or "").strip() or None
     depth = target.get("depth")  # None = full history (needed for secret scanning)
     if not url:
