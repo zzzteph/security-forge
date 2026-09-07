@@ -28,6 +28,9 @@ createApp({
       sort: {},               // { tableName: { key, dir } } — click-to-sort per table
       poll: null, clock: null, nowTs: Date.now(),
       menuOpen: false,        // mobile nav drawer
+      toast: null,            // transient notification
+      pageState: { findings: { page: 1, size: 25 }, scans: { page: 1, size: 25 }, repos: { page: 1, size: 25 } },
+      pageSizes: [10, 25, 50, 100, 'all'],
     };
   },
   computed: {
@@ -172,12 +175,20 @@ createApp({
     // model, keys, args) is one global template in Settings, applied to every scan.
     newRepo() {
       this.editing = 'new'; this.formErr = '';
-      this.repoForm = { url: '', name: '', cron: '', context: '', enabled: true };
+      this.repoForm = { url: '', name: '', cron: '', context: '', enabled: true, _nameTouched: false };
     },
     editRepo(r) {
       this.editing = r.id; this.formErr = '';
       this.repoForm = { id: r.id, url: r.url, name: r.name || '', cron: r.cron || '',
-        context: r.context || '', enabled: !!r.enabled };
+        context: r.context || '', enabled: !!r.enabled, _nameTouched: true };
+    },
+    deriveName(url) {
+      const s = (url || '').trim().replace(/\/+$/, '').replace(/\.git$/i, '');
+      return (s.split('/').filter(Boolean).pop() || '');
+    },
+    onRepoUrl() {
+      // auto-fill the Name from the repo URL until the user edits Name themselves
+      if (this.repoForm && !this.repoForm._nameTouched) this.repoForm.name = this.deriveName(this.repoForm.url);
     },
     async saveRepo() {
       this.formErr = '';
@@ -191,7 +202,34 @@ createApp({
       if (!confirm('Delete ' + r.slug + ' and its findings?')) return;
       await this.api('DELETE', '/api/repos/' + r.id); await this.loadRepos();
     },
-    async runScan(r) { await this.api('POST', '/api/repos/' + r.id + '/scan'); await this.loadRepos(); this.go('scans'); },
+    async runScan(r) {
+      await this.api('POST', '/api/repos/' + r.id + '/scan');
+      await this.loadRepos();
+      this.notify('Scan queued for ' + (r.name || r.slug) + '.');   // notify, don't redirect
+    },
+    notify(msg) {
+      this.toast = msg;
+      clearTimeout(this._toastT);
+      this._toastT = setTimeout(() => { this.toast = null; }, 3500);
+    },
+    // --- pagination: page a list for a table, with a size selector ('all' = no limit) ---
+    pageSlice(list, key) {
+      const st = this.pageState[key]; if (!st) return list;
+      if (st.size === 'all') return list;
+      const pages = Math.max(1, Math.ceil(list.length / st.size));
+      if (st.page > pages) st.page = pages;
+      const start = (st.page - 1) * st.size;
+      return list.slice(start, start + st.size);
+    },
+    pageMeta(total, key) {
+      const st = this.pageState[key];
+      if (!st || st.size === 'all') return { page: 1, pages: 1, from: total ? 1 : 0, to: total, total };
+      const pages = Math.max(1, Math.ceil(total / st.size));
+      const page = Math.min(st.page, pages);
+      return { page, pages, from: total ? (page - 1) * st.size + 1 : 0, to: Math.min(total, page * st.size), total };
+    },
+    setPageSize(key, n) { const st = this.pageState[key]; if (st) { st.size = n; st.page = 1; } },
+    pageGo(key, d) { const st = this.pageState[key]; if (st && st.size !== 'all') st.page = Math.max(1, st.page + d); },
 
     async openRepo(r, skipHash) {
       const d = await this.api('GET', '/api/repos/' + r.id);
@@ -446,7 +484,7 @@ createApp({
           <th @click="toggleSort('repos','open_findings')" style="cursor:pointer">Open{{caret('repos','open_findings')}}</th>
           <th @click="toggleSort('repos','last_status')" style="cursor:pointer">Last{{caret('repos','last_status')}}</th><th></th></tr></thead>
         <tbody>
-          <tr v-for="r in sortRows(repos,'repos')" :key="r.id">
+          <tr v-for="r in pageSlice(sortRows(repos,'repos'),'repos')" :key="r.id">
             <td><a @click="openRepo(r)">{{r.slug}}</a><div class="muted" v-if="!r.enabled">disabled</div></td>
             <td class="mono muted">{{r.cron||'—'}}</td>
             <td class="muted nowrap">{{fmt(r.next_run)||'—'}}</td>
@@ -458,7 +496,16 @@ createApp({
               <button class="sm danger" @click="deleteRepo(r)">✕</button></td>
           </tr>
           <tr v-if="!repos.length"><td colspan="6" class="muted">No repositories yet. Add one to start continuous scanning.</td></tr>
-        </tbody></table></div>
+        </tbody></table>
+        <div class="pager" v-if="repos.length">
+          <span class="muted">Rows</span>
+          <select style="width:auto" v-model="pageState.repos.size" @change="pageState.repos.page=1"><option v-for="n in pageSizes" :key="n" :value="n">{{n}}</option></select>
+          <span class="spacer"></span>
+          <span class="muted nowrap">{{pageMeta(repos.length,'repos').from}}–{{pageMeta(repos.length,'repos').to}} of {{repos.length}}</span>
+          <button class="sm" :disabled="pageMeta(repos.length,'repos').page<=1" @click="pageGo('repos',-1)">‹ Prev</button>
+          <button class="sm" :disabled="pageMeta(repos.length,'repos').page>=pageMeta(repos.length,'repos').pages" @click="pageGo('repos',1)">Next ›</button>
+        </div>
+      </div>
     </div>
 
     <!-- REPO DETAIL -->
@@ -523,14 +570,23 @@ createApp({
           <th @click="toggleSort('findings','file')" style="cursor:pointer">Where{{caret('findings','file')}}</th>
           <th @click="toggleSort('findings','status')" style="cursor:pointer">Status{{caret('findings','status')}}</th>
           <th @click="toggleSort('findings','last_seen')" style="cursor:pointer">Seen{{caret('findings','last_seen')}}</th></tr></thead>
-        <tbody><tr v-for="f in sortRows(triageFiltered(findings),'findings')" :key="f.id" style="cursor:pointer" @click="openFinding(f); view='finding'">
+        <tbody><tr v-for="f in pageSlice(sortRows(triageFiltered(findings),'findings'),'findings')" :key="f.id" style="cursor:pointer" @click="openFinding(f); view='finding'">
           <td><span class="badge" :class="'b-'+f.severity">{{f.severity}}</span></td>
           <td class="muted">{{f.slug}}</td><td>{{f.title}}</td>
           <td class="mono muted where">{{f.file}}{{f.line?':'+f.line:''}}</td>
           <td><span class="stwrap"><span class="pill" :class="f.status">{{f.status}}</span>
             <span v-if="f.triage && f.triage!=='unset'" class="tri" :class="'tri-'+f.triage">{{triageShort(f.triage)}}</span></span></td>
           <td class="muted nowrap">{{fmt(f.last_seen)}}</td></tr>
-          <tr v-if="!triageFiltered(findings).length"><td colspan="6" class="muted">No findings.</td></tr></tbody></table></div>
+          <tr v-if="!triageFiltered(findings).length"><td colspan="6" class="muted">No findings.</td></tr></tbody></table>
+        <div class="pager" v-if="triageFiltered(findings).length">
+          <span class="muted">Rows</span>
+          <select style="width:auto" v-model="pageState.findings.size" @change="pageState.findings.page=1"><option v-for="n in pageSizes" :key="n" :value="n">{{n}}</option></select>
+          <span class="spacer"></span>
+          <span class="muted nowrap">{{pageMeta(triageFiltered(findings).length,'findings').from}}–{{pageMeta(triageFiltered(findings).length,'findings').to}} of {{triageFiltered(findings).length}}</span>
+          <button class="sm" :disabled="pageMeta(triageFiltered(findings).length,'findings').page<=1" @click="pageGo('findings',-1)">‹ Prev</button>
+          <button class="sm" :disabled="pageMeta(triageFiltered(findings).length,'findings').page>=pageMeta(triageFiltered(findings).length,'findings').pages" @click="pageGo('findings',1)">Next ›</button>
+        </div>
+      </div>
     </div>
 
     <!-- FINDING DETAIL (advisory) -->
@@ -581,7 +637,7 @@ createApp({
           <th @click="toggleSort('scans','total_count')" style="cursor:pointer">Open{{caret('scans','total_count')}}</th>
           <th @click="toggleSort('scans','cost_usd')" style="cursor:pointer">Cost{{caret('scans','cost_usd')}}</th>
           <th @click="toggleSort('scans','started')" style="cursor:pointer">Started{{caret('scans','started')}}</th><th></th></tr></thead>
-        <tbody><tr v-for="s in sortRows(scans,'scans')" :key="s.id" style="cursor:pointer" @click="openScan(s)">
+        <tbody><tr v-for="s in pageSlice(sortRows(scans,'scans'),'scans')" :key="s.id" style="cursor:pointer" @click="openScan(s)">
           <td>{{s.id}}</td><td class="muted">{{s.slug}}</td><td class="muted">{{s.trigger}}</td>
           <td><span class="pill" :class="s.status"><span v-if="isLive(s)" class="dot pulse on"></span>{{s.status}}</span></td>
           <td>{{s.new_count}}</td><td>{{s.mitigated_count}}</td><td>{{s.total_count}}</td>
@@ -590,7 +646,16 @@ createApp({
           <td class="nowrap right">
             <button class="sm" @click.stop="relaunchScan(s)">Relaunch</button>
             <button class="sm danger" :disabled="isLive(s)" @click.stop="deleteScan(s)">✕</button></td></tr>
-          <tr v-if="!scans.length"><td colspan="10" class="muted">No scans yet.</td></tr></tbody></table></div>
+          <tr v-if="!scans.length"><td colspan="10" class="muted">No scans yet.</td></tr></tbody></table>
+        <div class="pager" v-if="scans.length">
+          <span class="muted">Rows</span>
+          <select style="width:auto" v-model="pageState.scans.size" @change="pageState.scans.page=1"><option v-for="n in pageSizes" :key="n" :value="n">{{n}}</option></select>
+          <span class="spacer"></span>
+          <span class="muted nowrap">{{pageMeta(scans.length,'scans').from}}–{{pageMeta(scans.length,'scans').to}} of {{scans.length}}</span>
+          <button class="sm" :disabled="pageMeta(scans.length,'scans').page<=1" @click="pageGo('scans',-1)">‹ Prev</button>
+          <button class="sm" :disabled="pageMeta(scans.length,'scans').page>=pageMeta(scans.length,'scans').pages" @click="pageGo('scans',1)">Next ›</button>
+        </div>
+      </div>
     </div>
 
     <!-- BACKENDS -->
@@ -672,8 +737,8 @@ createApp({
 <!-- REPO EDIT MODAL -->
 <div v-if="repoForm" class="modal-bg"><div class="modal">
   <h2 style="margin-top:0">{{editing=='new'?'Add repository':'Edit repository'}}</h2>
-  <label>Git URL</label><input v-model="repoForm.url" placeholder="https://github.com/OWNER/REPO">
-  <div class="row"><div><label>Name</label><input v-model="repoForm.name"></div>
+  <label>Git URL</label><input v-model="repoForm.url" @input="onRepoUrl" placeholder="https://github.com/OWNER/REPO">
+  <div class="row"><div><label>Name</label><input v-model="repoForm.name" @input="repoForm._nameTouched=true" placeholder="auto from URL"></div>
     <div><label>Schedule (cron, UTC)</label><input class="mono" v-model="repoForm.cron" placeholder="0 3 * * *"></div></div>
   <div class="muted" style="font-size:12px;margin-top:4px">{{cronText(repoForm.cron)}}</div>
   <label>Context — focus areas, what is NOT an issue, triage hints</label>
@@ -718,5 +783,8 @@ createApp({
   <div class="muted" style="font-size:12px;margin:6px 0">Follow the login prompts below. If a URL or device code appears, open it in your own browser to complete sign-in. Credentials persist on the data volume, so you only do this once.</div>
   <div ref="termEl" style="height:60vh;background:#0d1117;border:1px solid var(--line);border-radius:8px;padding:6px;overflow:hidden"></div>
 </div></div>
+
+<!-- TOAST -->
+<div v-if="toast" class="toast" @click="toast=null">{{toast}}</div>
 `,
 }).mount('#app');

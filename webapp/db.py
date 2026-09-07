@@ -205,6 +205,17 @@ def get_repo(rid: int) -> dict | None:
     return dict(r) if r else None
 
 
+def repo_by_url(url: str) -> dict | None:
+    """Find an existing repo by the slug its URL normalizes to (so http/https,
+    trailing .git, and case differences all resolve to the same repo)."""
+    slug = _slug(url or "")
+    if not slug:
+        return None
+    with connect() as c:
+        r = c.execute("SELECT * FROM repos WHERE slug=?", (slug,)).fetchone()
+    return dict(r) if r else None
+
+
 def upsert_repo(data: dict, rid: int | None = None) -> int:
     url = (data.get("url") or "").strip()
     slug = _slug(url)

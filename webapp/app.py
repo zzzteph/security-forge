@@ -12,6 +12,7 @@ import importlib.util
 import os
 import secrets
 import shutil
+import sqlite3
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, WebSocket
@@ -261,8 +262,13 @@ def repo_detail(rid: int, user: str = Depends(require_user)):
 async def create_repo(request: Request, user: str = Depends(require_user)):
     body = await request.json()
     if not (body.get("url") or "").strip():
-        raise HTTPException(400, "url required")
-    rid = db.upsert_repo(body)
+        raise HTTPException(400, "Enter a Git URL.")
+    if db.repo_by_url(body["url"]):
+        raise HTTPException(409, "This repository is already added — open it from the Repositories list.")
+    try:
+        rid = db.upsert_repo(body)
+    except sqlite3.IntegrityError:
+        raise HTTPException(409, "This repository is already added.")
     scheduler.reload()
     return {"ok": True, "id": rid}
 
@@ -272,7 +278,13 @@ async def update_repo(rid: int, request: Request, user: str = Depends(require_us
     if not db.get_repo(rid):
         raise HTTPException(404, "no such repo")
     body = await request.json()
-    db.upsert_repo(body, rid)
+    other = db.repo_by_url(body.get("url") or "")
+    if other and other["id"] != rid:
+        raise HTTPException(409, "Another repository already uses that URL.")
+    try:
+        db.upsert_repo(body, rid)
+    except sqlite3.IntegrityError:
+        raise HTTPException(409, "Another repository already uses that URL.")
     scheduler.reload()
     return {"ok": True}
 
