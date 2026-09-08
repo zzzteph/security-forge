@@ -98,6 +98,14 @@ def _findings_path(slug: str) -> Path:
     return DATA_ROOT / "knowledge" / slug / "findings.json"
 
 
+# Engine store statuses that mean "no longer an active finding": the analysis itself
+# retired it — `dismissed` = judged non-applicable (e.g. the agent honored an operator
+# comment / false-positive), `fixed` = remediated. Excluding these here makes the UI
+# reconcile mitigate them instead of keeping them open, so "orca" marking a finding
+# non-applicable actually removes it from the open list (it no longer resurfaces).
+_RESOLVED_ENGINE_STATUS = {"dismissed", "fixed"}
+
+
 def _load_findings(slug: str) -> list[dict]:
     p = _findings_path(slug)
     if not p.exists():
@@ -106,7 +114,25 @@ def _load_findings(slug: str) -> list[dict]:
         data = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return []
-    return list(data.values()) if isinstance(data, dict) else []
+    rows = list(data.values()) if isinstance(data, dict) else []
+    return [f for f in rows
+            if (f.get("status") or "").lower() not in _RESOLVED_ENGINE_STATUS]
+
+
+def _resolved_status_map(slug: str) -> dict[str, str]:
+    """{engine finding id -> 'dismissed'|'fixed'} for findings the analysis retired —
+    so reconcile can mitigate them with an accurate reason (not the generic
+    'not rediscovered')."""
+    p = _findings_path(slug)
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    rows = list(data.values()) if isinstance(data, dict) else []
+    return {f["id"]: (f.get("status") or "").lower() for f in rows
+            if f.get("id") and (f.get("status") or "").lower() in _RESOLVED_ENGINE_STATUS}
 
 
 def _run_scan(repo_id: int, scan_id: int) -> None:
@@ -229,7 +255,8 @@ def _run_scan(repo_id: int, scan_id: int) -> None:
         return
 
     findings = _load_findings(slug)
-    stats = db.reconcile_findings(repo_id, slug, scan_id, findings, commit)
+    stats = db.reconcile_findings(repo_id, slug, scan_id, findings, commit,
+                                  resolved=_resolved_status_map(slug))
     db.update_scan(scan_id, status="done", finished=db._now(), commit_sha=commit,
                    new_count=stats["new"], mitigated_count=stats["mitigated"],
                    total_count=stats["total"], cost_usd=cost, error=None)

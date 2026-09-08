@@ -301,10 +301,15 @@ createApp({
       if (!skipHash) this.pushHash('#/finding/' + (this.finding.uuid || f.uuid || f.id));
     },
     async saveTriage() {
-      await this.api('PUT', '/api/findings/' + encodeURIComponent(this.finding.uuid) + '/triage',
+      const d = await this.api('PUT', '/api/findings/' + encodeURIComponent(this.finding.uuid) + '/triage',
         { triage: this.finding.triage || 'unset', note: this.finding.triage_note || '' });
       this.finding.triaged_by = this.me.username; this.finding.triaged_at = new Date().toISOString();
-      this.triageMsg = 'Saved — future scans will see this.'; setTimeout(() => (this.triageMsg = ''), 2500);
+      if (d && d.status) this.finding.status = d.status;   // dismissive triage mitigates it
+      const dismissed = ['false_positive', 'wont_fix', 'duplicate'].includes(this.finding.triage);
+      this.triageMsg = dismissed
+        ? 'Saved — finding mitigated; it will stay dismissed and not resurface on rescans.'
+        : 'Saved — future scans will see this.';
+      setTimeout(() => (this.triageMsg = ''), 3000);
     },
     async addComment() {
       const body = (this.commentDraft || '').trim();
@@ -542,8 +547,10 @@ createApp({
           <b><span class="badge" :class="'b-'+s">{{(counts.by_severity||{})[s]||0}}</span></b><span>{{s.toLowerCase()}}</span></span>
         <span class="stat"><b>{{counts.scans||0}}</b><span>scans</span></span>
         <span class="stat"><b>{{money(counts.cost_usd)}}</b><span>total spend</span></span>
-        <button class="primary" style="float:right" @click="go('reports')">Reports →</button>
-        <button style="float:right;margin-right:8px" @click="pdf('/api/report.pdf')">Quick PDF (all)</button>
+        <div style="float:right;display:flex;gap:8px">
+          <button @click="pdf('/api/report.pdf')">Quick PDF (all)</button>
+          <button class="primary" @click="go('reports')">Reports →</button>
+        </div>
       </div>
       <div class="card">
         <div class="flex"><h2 style="margin-top:0">{{activeScans.length ? 'Active scans' : 'Recent scans'}}</h2>
@@ -771,8 +778,6 @@ createApp({
           <th @click="toggleSort('reports','title')" style="cursor:pointer">Title{{caret('reports','title')}}</th>
           <th @click="toggleSort('reports','status')" style="cursor:pointer">Status{{caret('reports','status')}}</th>
           <th>Findings</th>
-          <th @click="toggleSort('reports','model')" style="cursor:pointer">Model{{caret('reports','model')}}</th>
-          <th @click="toggleSort('reports','cost_usd')" style="cursor:pointer">Cost{{caret('reports','cost_usd')}}</th>
           <th @click="toggleSort('reports','created')" style="cursor:pointer">Created{{caret('reports','created')}}</th><th></th></tr></thead>
         <tbody>
           <tr v-for="r in sortRows(reports,'reports')" :key="r.uuid" style="cursor:pointer" @click="r.status==='done' && openReport(r)">
@@ -781,14 +786,12 @@ createApp({
             <td><span class="pill" :class="r.status"><span v-if="['queued','running'].includes(r.status)" class="dot pulse on"></span>{{r.status}}</span>
               <span v-if="r.error" class="muted" style="font-size:12px;display:block">{{r.error}}</span></td>
             <td class="muted">{{r.summary || '—'}}</td>
-            <td class="mono muted nowrap">{{r.model || '—'}}</td>
-            <td class="nowrap">{{money(r.cost_usd)}}</td>
             <td class="muted nowrap">{{fmt(r.created)}}</td>
             <td class="nowrap right">
               <button class="sm" :disabled="r.status!=='done'" @click.stop="pdf('/api/reports/'+r.uuid+'.pdf')">PDF</button>
               <button class="sm" :disabled="r.status!=='done'" @click.stop="pdf('/api/reports/'+r.uuid+'.md')">MD</button>
               <button class="sm danger" :disabled="['queued','running'].includes(r.status)" @click.stop="deleteReport(r)">✕</button></td></tr>
-          <tr v-if="!reports.length"><td colspan="8" class="muted">No reports yet — click Generate portfolio report, or open a repository and generate one there.</td></tr>
+          <tr v-if="!reports.length"><td colspan="6" class="muted">No reports yet — click Generate portfolio report, or open a repository and generate one there.</td></tr>
         </tbody></table></div>
     </div>
 

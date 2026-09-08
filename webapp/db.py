@@ -516,10 +516,15 @@ def _finding_fields(f: dict) -> dict:
 
 
 def reconcile_findings(repo_id: int, slug: str, scan_id: int,
-                       new_findings: list[dict], commit: str | None) -> dict:
+                       new_findings: list[dict], commit: str | None,
+                       resolved: dict[str, str] | None = None) -> dict:
     """Upsert this scan's findings and MITIGATE any previously-open finding that was
-    not rediscovered — recording the reason. Returns {new, mitigated, total}."""
+    not rediscovered — recording the reason. `resolved` maps an engine finding id to
+    the status the analysis retired it with ('dismissed'/'fixed') so those get an
+    accurate mitigation reason instead of the generic 'not rediscovered'. Returns
+    {new, mitigated, total}."""
     now = _now()
+    resolved = resolved or {}
     seen_ids = set()
     n_new = 0
     with connect() as c:
@@ -545,9 +550,17 @@ def reconcile_findings(repo_id: int, slug: str, scan_id: int,
                 seen_ids.add(key)
                 dk_to_id.setdefault(dk, key)
                 sets = ", ".join(f"{k}=?" for k in fields)
-                c.execute(f"UPDATE findings SET {sets}, status='open', mitigation_reason=NULL, "
-                          f"fixed_at=NULL, last_seen=?, last_commit=?, last_scan_id=? WHERE id=?",
-                          (*fields.values(), now, commit, scan_id, key))
+                # An operator-dismissed finding (false positive / won't-fix / duplicate)
+                # stays mitigated even if a rescan re-reports the same code — the human
+                # decision wins over rediscovery, so it never resurfaces as open.
+                if (prev.get(key) or {}).get("triage") in TRIAGE_MITIGATE:
+                    c.execute(f"UPDATE findings SET {sets}, last_seen=?, last_commit=?, "
+                              f"last_scan_id=? WHERE id=?",
+                              (*fields.values(), now, commit, scan_id, key))
+                else:
+                    c.execute(f"UPDATE findings SET {sets}, status='open', mitigation_reason=NULL, "
+                              f"fixed_at=NULL, last_seen=?, last_commit=?, last_scan_id=? WHERE id=?",
+                              (*fields.values(), now, commit, scan_id, key))
             else:
                 n_new += 1
                 cols = list(fields) + ["id", "uuid", "repo_id", "slug", "status", "first_seen",
@@ -559,14 +572,26 @@ def reconcile_findings(repo_id: int, slug: str, scan_id: int,
                           f"VALUES ({', '.join('?' * len(cols))})", tuple(vals))
                 seen_ids.add(key)
                 dk_to_id[dk] = key
-        # mitigate the ones that vanished
+        # mitigate the ones that vanished — but a human who marked a finding
+        # 'confirmed' outranks the engine: keep it open even if a scan stops
+        # reporting it (e.g. the analysis dismissed something the reviewer insists on).
         n_mit = 0
         for key, r in prev.items():
-            if key not in seen_ids and r["status"] == "open":
+            if (key not in seen_ids and r["status"] == "open"
+                    and (r.get("triage") or "unset") not in TRIAGE_KEEP_OPEN):
                 n_mit += 1
-                reason = (f"Not rediscovered in scan #{scan_id}"
-                          + (f" at commit {commit[:8]}" if commit else "")
-                          + f" ({now}); previously seen {r.get('last_seen') or r.get('first_seen')}.")
+                eng = resolved.get(r.get("fid"))
+                seen = r.get("last_seen") or r.get("first_seen")
+                at = (f" at commit {commit[:8]}" if commit else "")
+                if eng == "dismissed":
+                    reason = (f"Dismissed as non-applicable by the analysis in scan "
+                              f"#{scan_id}{at} ({now}).")
+                elif eng == "fixed":
+                    reason = (f"Marked fixed (remediated) by the analysis in scan "
+                              f"#{scan_id}{at} ({now}).")
+                else:
+                    reason = (f"Not rediscovered in scan #{scan_id}{at} ({now}); "
+                              f"previously seen {seen}.")
                 c.execute("UPDATE findings SET status='mitigated', mitigation_reason=?, "
                           "fixed_at=? WHERE id=?", (reason, now, key))
         total = c.execute("SELECT COUNT(*) FROM findings WHERE repo_id=? AND status='open'",
@@ -626,16 +651,57 @@ TRIAGE_DISMISSED = ("false_positive", "accepted_risk", "wont_fix", "duplicate")
 TRIAGE_LABEL = {"unset": "Untriaged", "confirmed": "Confirmed",
                 "false_positive": "False positive", "accepted_risk": "Accepted risk",
                 "wont_fix": "Won't fix", "duplicate": "Duplicate"}
+# Dispositions that mean "not a real, actionable finding": setting one RETIRES the
+# finding (status=mitigated) so it leaves the open list and does NOT resurface on
+# rescans (see reconcile_findings); clearing it back to unset/confirmed/accepted_risk
+# REOPENS it. accepted_risk is intentionally excluded — it is a real risk the operator
+# knowingly accepts, so it stays visible (just flagged, and fed forward to the agent).
+TRIAGE_MITIGATE = ("false_positive", "wont_fix", "duplicate")
+# Dispositions that mean "this IS a real finding — keep tracking it": the human
+# outranks the engine, so these stay open and are NOT auto-mitigated even if a scan
+# stops reporting them (see reconcile_findings).
+TRIAGE_KEEP_OPEN = ("confirmed", "accepted_risk")
+_DISMISS_PREFIX = "Operator-dismissed"
 
 
-def set_triage(uuid: str, triage: str, note: str, user: str) -> bool:
+def set_triage(uuid: str, triage: str, note: str, user: str) -> str | None:
+    """Record the operator's disposition. A dismissive disposition (TRIAGE_MITIGATE)
+    also mitigates the finding; clearing a dismissal we applied reopens it. Returns the
+    finding's resulting status ('open'/'mitigated'), or None if there is no such finding."""
     if triage not in TRIAGE_VALUES:
         raise ValueError(f"invalid triage '{triage}'")
+    note = (note or "").strip() or None
+    now = _now()
     with connect() as c:
-        cur = c.execute("UPDATE findings SET triage=?, triage_note=?, triaged_by=?, "
-                        "triaged_at=? WHERE uuid=?",
-                        (triage, (note or "").strip() or None, user, _now(), uuid))
-    return cur.rowcount > 0
+        row = c.execute("SELECT status, mitigation_reason FROM findings WHERE uuid=?",
+                        (uuid,)).fetchone()
+        if not row:
+            return None
+        if triage in TRIAGE_MITIGATE:
+            reason = (f"{_DISMISS_PREFIX} as {TRIAGE_LABEL[triage]} by {user} ({now})"
+                      + (f": {note}" if note else "."))
+            c.execute("UPDATE findings SET triage=?, triage_note=?, triaged_by=?, triaged_at=?, "
+                      "status='mitigated', mitigation_reason=?, fixed_at=? WHERE uuid=?",
+                      (triage, note, user, now, reason, now, uuid))
+            return "mitigated"
+        if triage in TRIAGE_KEEP_OPEN:
+            # Human asserts this is a real finding to track -> ensure it is open, even if
+            # a scan (or the engine) had mitigated it. The human outranks the engine.
+            c.execute("UPDATE findings SET triage=?, triage_note=?, triaged_by=?, triaged_at=?, "
+                      "status='open', mitigation_reason=NULL, fixed_at=NULL WHERE uuid=?",
+                      (triage, note, user, now, uuid))
+            return "open"
+        # 'unset' — undo ONLY a dismissal we applied (never resurrect a finding a scan
+        # legitimately mitigated by non-rediscovery / fix).
+        if (row["status"] == "mitigated"
+                and (row["mitigation_reason"] or "").startswith(_DISMISS_PREFIX)):
+            c.execute("UPDATE findings SET triage=?, triage_note=?, triaged_by=?, triaged_at=?, "
+                      "status='open', mitigation_reason=NULL, fixed_at=NULL WHERE uuid=?",
+                      (triage, note, user, now, uuid))
+            return "open"
+        c.execute("UPDATE findings SET triage=?, triage_note=?, triaged_by=?, triaged_at=? "
+                  "WHERE uuid=?", (triage, note, user, now, uuid))
+        return row["status"]
 
 
 def add_comment(finding_uuid: str, author: str, body: str) -> dict:

@@ -408,10 +408,11 @@ async def set_finding_triage(fid: str, request: Request, user: str = Depends(req
         raise HTTPException(404, "no such finding")
     body = await request.json()
     try:
-        db.set_triage(f["uuid"], (body.get("triage") or "unset"), body.get("note") or "", user)
+        status = db.set_triage(f["uuid"], (body.get("triage") or "unset"),
+                               body.get("note") or "", user)
     except ValueError as e:
         raise HTTPException(400, str(e))
-    return {"ok": True}
+    return {"ok": True, "status": status}
 
 
 @app.post("/api/findings/{fid}/comments")
