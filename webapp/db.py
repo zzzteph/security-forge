@@ -34,7 +34,11 @@ def connect() -> sqlite3.Connection:
     return c
 
 
-def init() -> None:
+def _migration_0001_baseline() -> None:
+    """Baseline schema — every table + index plus the additive column/backfill steps
+    that predate the versioned runner. Fully idempotent (CREATE ... IF NOT EXISTS and
+    guarded ALTERs), so it is a safe no-op on a fresh DB and on any DB from an earlier
+    build alike."""
     with connect() as c:
         c.executescript(
             """
@@ -90,9 +94,24 @@ def init() -> None:
                 content TEXT NOT NULL DEFAULT '', enabled INTEGER DEFAULT 1,
                 created TEXT, updated TEXT
             );
+            CREATE TABLE IF NOT EXISTS reports (
+                id INTEGER PRIMARY KEY, uuid TEXT UNIQUE,
+                repo_id INTEGER,                     -- NULL = portfolio (all repos)
+                slug TEXT, title TEXT, scope TEXT,   -- scope = human label ("all repositories" | slug)
+                status TEXT DEFAULT 'queued',        -- queued|running|done|error
+                trigger TEXT DEFAULT 'manual',
+                markdown TEXT DEFAULT '',            -- the full report artifact (narrative + appendix)
+                summary TEXT,                        -- one-line AI summary, for the list
+                model TEXT, cost_usd REAL DEFAULT 0, error TEXT,
+                findings_count INTEGER DEFAULT 0,
+                sev_json TEXT DEFAULT '{}',          -- {severity: n} snapshot for stat tiles
+                created TEXT, started TEXT, finished TEXT,
+                FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+            );
             CREATE INDEX IF NOT EXISTS idx_find_repo ON findings(repo_id);
             CREATE INDEX IF NOT EXISTS idx_find_sev  ON findings(severity);
             CREATE INDEX IF NOT EXISTS idx_scan_repo ON scans(repo_id);
+            CREATE INDEX IF NOT EXISTS idx_report_repo ON reports(repo_id);
             """
         )
         # Migration: per-repo LLM/agent args (added after first release).
@@ -134,6 +153,72 @@ def init() -> None:
             c.execute("UPDATE findings SET dedup_key=? WHERE id=?",
                       (_dedup_key(r["slug"], dict(r)), r["id"]))
         c.execute("CREATE INDEX IF NOT EXISTS idx_find_dedup ON findings(repo_id,dedup_key)")
+
+
+# --- versioned schema migrations --------------------------------------------
+# Point the app at any /data folder and init() brings that DB up to the current
+# schema, running ONLY the migrations it is missing and recording each in the
+# `schema_migrations` ledger. Every migration MUST be idempotent (CREATE ... IF NOT
+# EXISTS, guarded ALTERs) so a re-run — or a run against a DB already at that
+# version — is a safe no-op.
+#
+# To add one: write an idempotent `_migration_NNNN_*()` and append
+# `(<next int>, "<what it does>", <fn>)` to _MIGRATIONS. Nothing else to bump — the
+# target version is simply the highest entry.
+
+_MIGRATIONS = [
+    (1, "baseline schema", _migration_0001_baseline),
+]
+SCHEMA_VERSION = _MIGRATIONS[-1][0]
+
+
+def _run_migrations() -> None:
+    with connect() as c:
+        c.execute("CREATE TABLE IF NOT EXISTS schema_migrations ("
+                  "version INTEGER PRIMARY KEY, name TEXT, applied_at TEXT)")
+        applied = {r[0] for r in c.execute("SELECT version FROM schema_migrations")}
+    newest = max(applied) if applied else 0
+    if newest > SCHEMA_VERSION:
+        print(f"[db] WARNING: this database is at schema v{newest}, but this build "
+              f"only knows up to v{SCHEMA_VERSION}. Proceeding — it was written by a "
+              f"newer security-forge; update this build if anything looks off.")
+    for ver, name, fn in sorted(_MIGRATIONS):
+        if ver in applied:
+            continue
+        fn()                                    # idempotent DDL (opens its own txn)
+        with connect() as c:
+            c.execute("INSERT OR REPLACE INTO schema_migrations(version,name,applied_at) "
+                      "VALUES(?,?,?)", (ver, name, _now()))
+        print(f"[db] applied schema migration v{ver}: {name}")
+
+
+def schema_version() -> int:
+    """Highest migration version applied to this DB (0 = brand new / pre-migrations,
+    or a legacy DB whose ledger has not been created yet)."""
+    try:
+        with connect() as c:
+            r = c.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
+    except sqlite3.OperationalError:
+        return 0
+    return int(r[0]) if r and r[0] is not None else 0
+
+
+def schema_info() -> dict:
+    """{version, target, applied:[{version,name,applied_at}]} — for display/debugging."""
+    try:
+        with connect() as c:
+            rows = [dict(r) for r in c.execute(
+                "SELECT version,name,applied_at FROM schema_migrations ORDER BY version")]
+    except sqlite3.OperationalError:
+        rows = []
+    return {"version": rows[-1]["version"] if rows else 0,
+            "target": SCHEMA_VERSION, "applied": rows}
+
+
+def init() -> None:
+    """Bring the DB in the configured /data folder up to the current schema, then run
+    idempotent data fixups and ensure the seed user exists."""
+    _run_migrations()
     _collapse_duplicate_findings()
     seed_root_user()
 
@@ -313,6 +398,59 @@ def delete_scan(sid: int) -> None:
         c.execute("DELETE FROM scans WHERE id=?", (sid,))
         # If a repo pointed at this scan as its 'last', clear the dangling reference.
         c.execute("UPDATE repos SET last_scan_id=NULL WHERE last_scan_id=?", (sid,))
+
+
+# --- reports (AI-written, shareable executive reports) ----------------------
+
+def create_report(repo_id: int | None, slug: str, scope: str, title: str,
+                  trigger: str = "manual") -> tuple[int, str]:
+    """Create a queued report row. repo_id=None means a portfolio (all-repos) report.
+    Returns (id, uuid)."""
+    uuid = new_uuid()
+    with connect() as c:
+        cur = c.execute(
+            "INSERT INTO reports(uuid,repo_id,slug,scope,title,status,trigger,created) "
+            "VALUES(?,?,?,?,?,'queued',?,?)",
+            (uuid, repo_id, slug, scope, title, trigger, _now()))
+        return cur.lastrowid, uuid
+
+
+def update_report(rid: int, **kw) -> None:
+    if not kw:
+        return
+    sets = ", ".join(f"{k}=?" for k in kw)
+    with connect() as c:
+        c.execute(f"UPDATE reports SET {sets} WHERE id=?", (*kw.values(), rid))
+
+
+def get_report(rid: int) -> dict | None:
+    with connect() as c:
+        r = c.execute("SELECT * FROM reports WHERE id=?", (rid,)).fetchone()
+    return dict(r) if r else None
+
+
+def get_report_by_uuid(uuid: str) -> dict | None:
+    with connect() as c:
+        r = c.execute("SELECT * FROM reports WHERE uuid=?", (uuid,)).fetchone()
+    return dict(r) if r else None
+
+
+def list_reports(repo_id: int | None = None, limit: int = 200) -> list[dict]:
+    """Reports newest-first. Omits the (large) markdown body for the list view.
+    Pass repo_id to see the reports generated for one repo; omit for every report."""
+    q = ("SELECT id,uuid,repo_id,slug,scope,title,status,trigger,summary,model,"
+         "cost_usd,error,findings_count,sev_json,created,started,finished FROM reports")
+    v: list = []
+    if repo_id is not None:
+        q += " WHERE repo_id=?"; v.append(repo_id)
+    q += " ORDER BY id DESC LIMIT ?"; v.append(limit)
+    with connect() as c:
+        return [dict(r) for r in c.execute(q, tuple(v))]
+
+
+def delete_report(rid: int) -> None:
+    with connect() as c:
+        c.execute("DELETE FROM reports WHERE id=?", (rid,))
 
 
 # --- findings (global table + mitigation reconciliation) --------------------

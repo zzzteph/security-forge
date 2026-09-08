@@ -11,6 +11,8 @@ sessions never pile up. `enqueue()` is called by the scheduler (cron) and by the
 """
 from __future__ import annotations
 
+import dataclasses
+import itertools
 import json
 import os
 import queue
@@ -23,16 +25,37 @@ import time
 from pathlib import Path
 
 import db
+import reportgen
 
 ROOT = Path(__file__).resolve().parent.parent          # security-forge repo root
 PY = sys.executable or "python"
 DATA_ROOT = db.DATA_ROOT
 
-_q: "queue.Queue[tuple[int, int, str]]" = queue.Queue()   # (repo_id, scan_id, trigger)
+# Priority queue: report jobs (priority 0) are taken ahead of scans (priority 10),
+# so a "Generate report" click jumps the line in front of pending scans. A running
+# job is never preempted. `seq` keeps ordering stable within a priority and makes
+# every queue item strictly orderable (so PriorityQueue never compares two _Job).
+_PRIORITY = {"report": 0, "scan": 10}
+_seq = itertools.count()
+
+
+@dataclasses.dataclass
+class _Job:
+    kind: str          # 'scan' | 'report'
+    repo_id: int | None
+    ref_id: int        # scan_id or report_id
+    trigger: str
+
+
+_q: "queue.PriorityQueue[tuple[int, int, _Job]]" = queue.PriorityQueue()
 _lock = threading.Lock()
-_running: dict[int, int] = {}      # scan_id -> repo_id (currently executing)
-_desired = 1                       # target number of concurrent orchestrators
+_running: dict[tuple[str, int], int | None] = {}   # (kind, ref_id) -> repo_id
+_desired = 1                       # target number of concurrent workers
 _live = 0                          # worker threads alive
+
+
+def _submit(job: _Job) -> None:
+    _q.put((_PRIORITY.get(job.kind, 50), next(_seq), job))
 
 
 def enqueue(repo_id: int, trigger: str = "manual") -> int:
@@ -41,14 +64,33 @@ def enqueue(repo_id: int, trigger: str = "manual") -> int:
     if not repo:
         raise ValueError("no such repo")
     scan_id = db.create_scan(repo_id, repo["slug"], trigger)
-    _q.put((repo_id, scan_id, trigger))
+    _submit(_Job("scan", repo_id, scan_id, trigger))
     return scan_id
+
+
+def enqueue_report(repo_id: int | None, trigger: str = "manual") -> dict:
+    """Queue an executive report — repo_id=None means a portfolio (all-repos)
+    report. Priority over scans. Returns the created report row's {id, uuid}."""
+    if repo_id is not None:
+        repo = db.get_repo(repo_id)
+        if not repo:
+            raise ValueError("no such repo")
+        slug, scope = repo["slug"], repo["slug"]
+        title = f"Security Report — {repo.get('name') or slug}"
+    else:
+        slug, scope, title = "", "all repositories", "Portfolio Security Report"
+    report_id, uuid = db.create_report(repo_id, slug, scope, title, trigger)
+    _submit(_Job("report", repo_id, report_id, trigger))
+    return {"id": report_id, "uuid": uuid}
 
 
 def status() -> dict:
     with _lock:
-        running = list(_running.keys())
-    return {"running": running, "running_count": len(running),
+        scans = [ref for (kind, ref) in _running if kind == "scan"]
+        reports_running = [ref for (kind, ref) in _running if kind == "report"]
+    return {"running": scans, "running_count": len(scans),
+            "reports_running": reports_running,
+            "reports_running_count": len(reports_running),
             "queued": _q.qsize(), "max": _desired}
 
 
@@ -203,6 +245,10 @@ def _finalize_repo(repo_id: int, scan_id: int, st: str, commit: str | None) -> N
                   (scan_id, st, db._now(), repo_id))
 
 
+def _run_report(report_id: int) -> None:
+    reportgen.run_report(report_id)
+
+
 def _worker() -> None:
     global _live
     while True:
@@ -212,23 +258,31 @@ def _worker() -> None:
                 _live -= 1
                 return
         try:
-            repo_id, scan_id, _trigger = _q.get(timeout=1.0)
+            _prio, _n, job = _q.get(timeout=1.0)
         except queue.Empty:
             continue
+        key = (job.kind, job.ref_id)
         with _lock:
-            _running[scan_id] = repo_id
+            _running[key] = job.repo_id
         try:
-            _run_scan(repo_id, scan_id)
+            if job.kind == "report":
+                _run_report(job.ref_id)
+            else:
+                _run_scan(job.repo_id, job.ref_id)
         except Exception as e:  # noqa: BLE001  (never let the worker die)
             try:
-                db.update_scan(scan_id, status="error", error=str(e)[:500],
-                               finished=db._now())
-                _finalize_repo(repo_id, scan_id, "error", None)
+                if job.kind == "report":
+                    db.update_report(job.ref_id, status="error",
+                                     error=str(e)[:500], finished=db._now())
+                else:
+                    db.update_scan(job.ref_id, status="error", error=str(e)[:500],
+                                   finished=db._now())
+                    _finalize_repo(job.repo_id, job.ref_id, "error", None)
             except Exception:
                 pass
         finally:
             with _lock:
-                _running.pop(scan_id, None)
+                _running.pop(key, None)
             _q.task_done()
 
 
