@@ -61,8 +61,11 @@ anything reachable from them, but use the model to see what calls them.
    credibility than ten true findings earn.** `findings: []` is a fine, honest
    result — never pad.
 
-(Access control is covered by the dedicated `authz-analyzer`; focus here on
-injection/dataflow classes. If you spot an obvious authz gap, note it in `notes`.)
+(Access control is covered by the dedicated `authz-analyzer`, and business-logic /
+state-machine bugs — illegal transitions, negative/oversized amounts, total/price
+tampering, idempotency/replay, quota bypass — by the dedicated `logic-analyzer`;
+focus here on injection/dataflow classes. If you spot an obvious authz or logic gap
+outside your lane, note it in `notes` so that agent picks it up.)
 
 You may run read-only shell (`rg`, `python scripts/pipeline.py get --brief`).
 Do not modify or run the target — dynamic verification is a separate agent.

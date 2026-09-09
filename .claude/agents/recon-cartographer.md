@@ -88,6 +88,23 @@ scope's slice**:
     {"target": "payments/charge", "kind": "http", "where": "src/orders/pay.py:60", "auth_sent": "service JWT"},
     {"target": "inventory.reserve", "kind": "grpc", "where": "src/orders/stock.py:22"}
   ],
+  "invariants": [
+    {"id": "inv-order-total", "statement": "order.total == sum(line_items.qty * unit_price)",
+     "objects": ["order", "line_item"], "kind": "arithmetic",
+     "evidence": "computed in OrderService.recalc@src/svc/order.py:40; asserted in tests/test_orders.py:40",
+     "enforced_at": ["src/svc/order.py:40"]},
+    {"id": "inv-balance-nonneg", "statement": "wallet.balance >= 0", "objects": ["wallet"],
+     "kind": "non-negative", "evidence": "CHECK constraint @ migrations/0003.sql:5", "enforced_at": ["migrations/0003.sql:5"]}
+  ],
+  "lifecycles": [
+    {"object": "order", "state_field": "order.status",
+     "states": ["cart", "pending", "paid", "shipped", "refunded", "cancelled"],
+     "transitions": [
+       {"from": "pending", "to": "paid", "via": "POST /orders/:id/pay", "guard": "checks status=='pending'@src/api/orders.py:60"},
+       {"from": "paid", "to": "shipped", "via": "POST /orders/:id/ship", "guard": "none"}
+     ],
+     "evidence": "status enum @ src/models/order.py:12; transitions inferred from handlers"}
+  ],
   "trust_boundaries": ["browser->app", "app->stripe", "app->db"],
   "coverage": {"routers_read": ["src/api/__init__.py"], "areas": ["api", "auth", "models"], "unmapped": ["worker/ not yet read"]},
   "notes": "anything the orchestrator or later phases should know"
@@ -101,6 +118,19 @@ place this service calls ANOTHER service/API: HTTP clients (`HttpClient`, `fetch
 `auth_sent` (optional) is what credential it forwards. This is what lets a project
 cross-check "route in service A calls service B" — capture it whenever you can, even
 if partial.
+**`invariants` and `lifecycles` — the substrate for business-logic analysis.** These
+feed the `logic-analyzer`, so capture what you can (empty is fine; never fabricate).
+- `invariants` = rules that must ALWAYS hold about the crown-jewel objects — money
+  (`balance >= 0`, `total == sum(items)`), quantity (`qty > 0`), uniqueness
+  (one vote/redemption per user), ownership, monotonic counters. Derive them from DB
+  **constraints** (`CHECK`/`UNIQUE`/FK), validation code, comments, and what **tests
+  assert**; tie each to `evidence` (`file:line`) and list any `enforced_at`. `kind` ∈
+  arithmetic|non-negative|uniqueness|state|ownership|monotonic.
+- `lifecycles` = for each **stateful** object, its `state_field`, the set of `states`
+  (from a status enum/column), and the `transitions` you can see — each with the
+  entrypoint that performs it and whether that handler `guard`s the current state
+  (or `none`). This is inferred from handlers that write the status field; be honest
+  where you could not resolve a transition.
 `entrypoints[].id` must be stable (method + normalized route, or
 `kind:handler_file:symbol`) so incremental runs can diff the surface and map
 changed files back to entry points. Be honest in `coverage.unmapped` — say what

@@ -27,11 +27,13 @@ analysis:
     - secrets & credential handling
     - insecure crypto & session management
     - access control / IDOR
+    - business logic / state-machine (illegal transitions, negative/oversized amounts, total/price tampering, idempotency & replay of money actions, quota bypass, check-then-act)
   changed_only_after_first_scan: true
   max_verify_per_cycle: 3
   max_recon_agents: 3            # cap parallel recon-cartographers (large-repo fan-out guard)
   max_authz_agents: 4           # cap parallel authz-analyzers (area agents + auth-mechanism)
   max_analyzer_agents: 6        # cap parallel code-analyzer (dataflow) subagents
+  max_logic_agents: 3           # cap parallel logic-analyzer (business-logic/state) subagents; re-run on incremental when changed files touch state/status/money/quota or an invariant's objects
   # On a very large repo, DON'T try to fully analyze + verify in one cycle: cap
   # fan-out to these budgets, cover the highest-value areas first, record partial
   # coverage, and let the next (incremental) cycle continue from the persisted model.

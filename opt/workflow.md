@@ -149,16 +149,17 @@ summary are emitted as loud notices):
 python scripts/pipeline.py notify --silent "⏳ <repo>@<sha>: comprehension done — 42 entrypoints, 3 roles; running authz…"
 ```
 Announce: **start** · **comprehension** (entrypoints/roles) · **guardrail**
-(hotspots) · **authz** (candidates) · **dataflow** (candidates) · **verifying**
-(n) · **done** (the §10 summary — emitted as a notice, not silent). If running
-interactively, also keep a short `TodoWrite` plan updated.
+(hotspots) · **authz** (candidates) · **dataflow** (candidates) · **logic**
+(invariants/state) · **verifying** (n) · **done** (the §10 summary — emitted as a
+notice, not silent). If running interactively, also keep a short `TodoWrite` plan
+updated.
 
 ### How to run the analysis roles (works with or without installed agents)
 Each analysis role has a **brief** at `$SECFORGE_HOME/.claude/agents/<role>.md`. To
 run a role, spawn a subagent with the Agent tool:
 - **Preferred:** `subagent_type: "<role>"` (recon-cartographer / authz-analyzer /
-  code-analyzer / finding-verifier) if that type is available (it will be when
-  Claude runs from this folder or the installed plugin).
+  code-analyzer / logic-analyzer / finding-verifier) if that type is available (it
+  will be when Claude runs from this folder or the installed plugin).
 - **Always-works fallback:** `subagent_type: "general-purpose"`, and begin the
   prompt with *"Read `$SECFORGE_HOME/.claude/agents/<role>.md` (substitute the
   absolute path) and follow it exactly as your instructions,"* then add the
@@ -213,11 +214,17 @@ so parallel agents never race on it. Minimum schema:
   "auth": {"authn": {"mechanism": "", "established_at": "", "identity_read": ""},
            "authz": {"model": "", "enforced_at": [], "gaps": [], "object_level": ""}},
   "calls": [{"target": "other-service/route", "kind": "http|grpc|bus", "where": "file:line", "auth_sent": ""}],
+  "invariants": [{"id": "", "statement": "order.total == sum(items.qty*price)", "objects": [], "kind": "arithmetic|non-negative|uniqueness|state|ownership|monotonic", "evidence": "file:line", "enforced_at": []}],
+  "lifecycles": [{"object": "order", "state_field": "order.status", "states": [], "transitions": [{"from": "", "to": "", "via": "METHOD /route", "guard": "file:line|none"}], "evidence": ""}],
   "trust_boundaries": [], "coverage": {"areas": [], "unmapped": []}
 }
 ```
 `calls` = OUTBOUND service dependencies (what this service calls in OTHER services) —
 capture HTTP/gRPC/bus targets so a project can cross-check "route in A calls B".
+`invariants` (rules that must always hold — money/quantity/uniqueness, each tied to
+evidence: a DB constraint, validation, or a test assertion) and `lifecycles`
+(stateful objects: `state_field`, `states`, and the guarded/unguarded `transitions`)
+feed **Phase D3**; capture what you can, leave empty rather than fabricate.
 `entrypoints[].id` and `.files` are what incremental runs use to map a changed
 file back to an entry point.
 
@@ -381,6 +388,39 @@ Re-rating **may go down as well as up**: if the composition you assumed does not
 hold, lower the severity and say so. Record the change in `severity_rationale`
 (what composed, with `file:line`), and log a one-line note per re-rating. Then
 `add-finding` any genuinely new composed finding, linking its constituents.
+
+## 6.6. Phase D3 — Business-logic & state-machine analysis (STATIC)
+Taint (Phase D) and access control (Phase C) miss a whole class: bugs in the app's
+**rules about state and arithmetic** — ship-without-pay, negative/oversized amounts,
+client-set `total`/`status`, double-refund / coupon-replay, quota bypass,
+check-then-act. Follow the **logic-analyzer** brief; fan out one subagent per
+stateful area (money/wallet, orders/checkout, coupons/credits, quotas, account
+state), up to `max_logic_agents`, in parallel. Skip only if the model has no
+`invariants`, no `lifecycles`, and no money/quantity/state fields anywhere.
+
+Each agent is model-driven — it consumes `model.json.invariants` + `lifecycles` —
+and returns findings plus a required **`invariant_matrix`** (invariant × write-path ×
+enforcement × verdict) and **`transition_matrix`** (object × transition × guard ×
+verdict); those matrices are coverage proof, exactly like the authz
+`coverage_matrix`. Merge any `model_updates` (derived invariants/lifecycles) back
+into `model.json`.
+
+This pass is **STATIC and read-only** — the agent never builds or runs the target.
+A logic finding is confirmed the same way as any other (read the code, trace
+`entrypoint → state-mutation` with a `file:line` per hop, user-reachable, one-line
+impact, and **name the enforcement you looked for and found absent** — a DB
+constraint, transaction, row lock, unique/idempotency key, or state-machine). A rule
+that any of those already enforces is `dismissed` (name it); an unreachable or
+evidence-free rule is not a finding. Record keepers with `add-finding` using a logic
+`category` (`invariant-violation|state-transition|insecure-idempotency|replay|numeric-abuse|quota-bypass|race-condition`),
+`fp_filter_checked` = the enforcement you ruled out, and a `poc` that is the
+**request *sequence*** which breaks the rule (the PoC *sketch* — the illegal step
+marked). These are reported **unverified** (§8): when Docker verification is
+available (CLI runs) a request-sequence PoC can later promote them; in the container
+/ UI deployment verification is OFF, so they stay static candidates and the
+**finding-refuter** pass is their independent check. Severity is derived from impact
+(money moved / goods shipped free / payment skipped ⇒ CRITICAL/HIGH), taking the
+lower rating where evidence is missing.
 
 ## 7. Phase E — Verify hypotheses in Docker with debug instrumentation
 Only if `verify.enabled`. **Verify EVERY recorded finding on a live environment —

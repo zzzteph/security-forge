@@ -228,7 +228,7 @@ def build_prompt(repo_url: str, slug: str, timeout: int, verify: bool = False) -
         f"never a one-liner), and `set-status` right after; never batch to the end. "
         f"(3) BREADTH BEFORE DEPTH on a large repo — cap subagent fan-out to the "
         f"config budget and cover the highest-value areas (authz/IDOR, injection, "
-        f"secrets) first. Partial coverage recorded is FINE: the next incremental "
+        f"secrets, business-logic/state) first. Partial coverage recorded is FINE: the next incremental "
         f"run resumes from the persisted knowledge/ model. "
         + verify_block + item4
     )
