@@ -27,6 +27,9 @@ createApp({
       current: null,          // repo detail
       finding: null,          // finding detail (advisory)
       scans: [], scanView: null,
+      reports: [], reportView: null, reportMsg: '',   // executive reports
+      pendingReport: false,   // true while a report we queued is queued/running (drives polling)
+      mdRender: true,         // advisory / report viewer: rendered markdown (true) vs raw source (false)
       // default sort so new rows land predictably (not "randomly"): repos A→Z, findings by severity
       sort: { repos: { key: 'slug', dir: 1 }, findings: { key: 'severity', dir: -1 } },
       poll: null, clock: null, nowTs: Date.now(),
@@ -83,10 +86,12 @@ createApp({
     },
     go(view, skipHash) {
       this.view = view; this.finding = null; this.current = null; this.scanView = null;
+      this.reportView = null;
       this.menuOpen = false;
       if (view === 'dashboard') this.loadDashboard();
       if (view === 'repos') this.loadRepos();
       if (view === 'findings') this.loadFindings();
+      if (view === 'reports') this.loadReports();
       if (view === 'scans') this.loadScans();
       if (view === 'skills') this.loadSkills();
       if (view === 'projects') this.loadProjects();
@@ -103,11 +108,12 @@ createApp({
       const i = raw.indexOf('/');
       const seg = i < 0 ? raw : raw.slice(0, i);
       const id = i < 0 ? '' : raw.slice(i + 1);
-      const views = ['dashboard', 'repos', 'findings', 'scans', 'projects', 'skills', 'backends', 'settings'];
+      const views = ['dashboard', 'repos', 'findings', 'reports', 'scans', 'projects', 'skills', 'backends', 'settings'];
       if (!seg || views.includes(seg)) return this.go(seg || 'dashboard', true);
       if (seg === 'finding' && id) { this.current = null; this.scanView = null; this.view = 'finding'; return this.openFinding({ uuid: id }, true); }
       if (seg === 'repo' && id) return this.openRepo({ id: +id }, true);
       if (seg === 'scan' && id) { this.go('scans', true); return this.openScan({ id: +id }, true); }
+      if (seg === 'report' && id) { this.view = 'reports'; return this.openReport({ uuid: id }, true); }
       this.go('dashboard', true);
     },
     async loadDashboard() {
@@ -259,9 +265,15 @@ createApp({
     async saveRepo() {
       this.formErr = '';
       try {
+        const editedId = this.editing === 'new' ? null : this.editing;
         if (this.editing === 'new') await this.api('POST', '/api/repos', this.repoForm);
         else await this.api('PUT', '/api/repos/' + this.editing, this.repoForm);
         this.editing = null; this.repoForm = null; await this.loadRepos();
+        // If the repo detail page is open on the one we just edited, reload it so the
+        // saved context (and everything else) is reflected — not a stale copy.
+        if (editedId && this.current && this.current.repo && this.current.repo.id === editedId) {
+          await this.openRepo(this.current.repo, true);
+        }
       } catch (e) { this.formErr = String(e.message || e); }
     },
     async deleteRepo(r) {
@@ -300,13 +312,17 @@ createApp({
     async openRepo(r, skipHash) {
       const d = await this.api('GET', '/api/repos/' + r.id);
       this.current = d; this.view = 'repo'; this.finding = null; this.scanView = null;
+      this.reportView = null;
+      this.loadReports().catch(() => {});   // populate this repo's report list
       if (!skipHash) this.pushHash('#/repo/' + r.id);
     },
+    repoReports(repoId) { return (this.reports || []).filter(r => r.repo_id === repoId); },
     async openFinding(f, skipHash) {
       this.view = 'finding';
       const d = await this.api('GET', '/api/findings/' + encodeURIComponent(f.uuid || f.id));
       this.finding = d.finding;
       this.finding._md = d.advisory_markdown;
+      this.finding._html = d.advisory_html || '';
       this.finding._comments = d.comments || [];
       this.finding._hints = d.review_hints || [];
       this.finding._triageValues = d.triage_values || Object.keys(TRIAGE_LABELS);
@@ -315,10 +331,15 @@ createApp({
       if (!skipHash) this.pushHash('#/finding/' + (this.finding.uuid || f.uuid || f.id));
     },
     async saveTriage() {
-      await this.api('PUT', '/api/findings/' + encodeURIComponent(this.finding.uuid) + '/triage',
+      const d = await this.api('PUT', '/api/findings/' + encodeURIComponent(this.finding.uuid) + '/triage',
         { triage: this.finding.triage || 'unset', note: this.finding.triage_note || '' });
       this.finding.triaged_by = this.me.username; this.finding.triaged_at = new Date().toISOString();
-      this.triageMsg = 'Saved — future scans will see this.'; setTimeout(() => (this.triageMsg = ''), 2500);
+      if (d && d.status) this.finding.status = d.status;   // dismissive triage mitigates it
+      const dismissed = ['false_positive', 'wont_fix', 'duplicate'].includes(this.finding.triage);
+      this.triageMsg = dismissed
+        ? 'Saved — finding mitigated; it will stay dismissed and not resurface on rescans.'
+        : 'Saved — future scans will see this.';
+      setTimeout(() => (this.triageMsg = ''), 3000);
     },
     async addComment() {
       const body = (this.commentDraft || '').trim();
@@ -338,6 +359,46 @@ createApp({
     },
     async loadScans() {
       const d = await this.api('GET', '/api/scans'); this.scans = d.scans; this.runner = d.runner;
+    },
+    // --- executive reports (AI-written, JET format, priority-queued) ---
+    async loadReports(repoId) {
+      const q = repoId != null ? ('?repo_id=' + repoId) : '';
+      const d = await this.api('GET', '/api/reports' + q);
+      this.reports = d.reports; if (d.runner) this.runner = d.runner;
+      this.pendingReport = (this.reports || []).some(r => ['queued', 'running'].includes(r.status));
+      return this.reports;
+    },
+    async generateReport(repoId) {
+      // repoId: a repo id for a dedicated report, or null/undefined for the whole portfolio
+      this.reportMsg = '';
+      try {
+        const path = repoId != null ? ('/api/repos/' + repoId + '/report')
+                                     : '/api/reports/generate';
+        await this.api('POST', path);
+        this.pendingReport = true;
+        await this.loadReports();
+        this.notify(repoId != null ? 'Report queued for this repository (takes priority).'
+                                   : 'Portfolio report queued (takes priority over scans).');
+      } catch (e) { this.reportMsg = String(e.message || e); this.notify(this.reportMsg); }
+    },
+    async openReport(r, skipHash) {
+      this.view = 'reports';
+      const d = await this.api('GET', '/api/reports/' + (r.uuid || r));
+      this.reportView = d.report;
+      this.reportView._html = d.html || '';
+      if (!skipHash) this.pushHash('#/report/' + this.reportView.uuid);
+    },
+    closeReport() { this.reportView = null; this.pushHash('#/reports'); },
+    async deleteReport(r) {
+      if (['queued', 'running'].includes(r.status)) { alert('This report is still ' + r.status + ' — wait for it to finish.'); return; }
+      if (!confirm('Delete this report?')) return;
+      await this.api('DELETE', '/api/reports/' + r.uuid);
+      if (this.reportView && this.reportView.uuid === r.uuid) this.reportView = null;
+      await this.loadReports();
+    },
+    reportRepoName(r) {
+      if (r.repo_id == null) return 'All repositories';
+      return r.scope || r.slug || ('repo ' + r.repo_id);
     },
     async openScan(s, skipHash) {
       const el = this.$refs.logEl;
@@ -438,9 +499,18 @@ createApp({
       if (this.view === 'scans') this.loadScans().catch(() => {});
       else if (this.view === 'dashboard') { this.loadScans().catch(() => {}); this.loadRepos().catch(() => {}); }
       if (liveOpen) this.openScan(this.scanView).catch(() => {});
+      // reports: keep the list fresh while any is queued/running, and refresh an open
+      // report until it finishes generating.
+      if (this.view === 'reports' || this.pendingReport) this.loadReports().catch(() => {});
+      if (this.reportView && ['queued', 'running'].includes(this.reportView.status)) {
+        this.openReport({ uuid: this.reportView.uuid }, true).catch(() => {});
+      }
       this.scheduleTick();
     },
-    anyLive() { return this.isLive(this.scanView) || ((this.runner && this.runner.running_count) > 0); },
+    anyLive() {
+      return this.isLive(this.scanView) || this.pendingReport
+        || ((this.runner && this.runner.running_count) > 0);
+    },
     scheduleTick() {
       // fast cadence (1.5s) whenever a scan is live (log modal open OR any running), else easy (4s)
       const delay = this.anyLive() ? 1500 : 4000;
@@ -479,6 +549,7 @@ createApp({
       <a :class="{on:view=='dashboard'}" @click="go('dashboard')">Dashboard</a>
       <a :class="{on:view=='repos'||view=='repo'}" @click="go('repos')">Repositories</a>
       <a :class="{on:view=='findings'||view=='finding'}" @click="go('findings')">Findings</a>
+      <a :class="{on:view=='reports'||view=='report'}" @click="go('reports')">Reports</a>
       <a :class="{on:view=='scans'}" @click="go('scans')">Scans</a>
       <a :class="{on:view=='projects'}" @click="go('projects')">Projects</a>
       <a :class="{on:view=='skills'}" @click="go('skills')">Skills</a>
@@ -508,7 +579,10 @@ createApp({
           <b><span class="badge" :class="'b-'+s">{{(counts.by_severity||{})[s]||0}}</span></b><span>{{s.toLowerCase()}}</span></span>
         <span class="stat"><b>{{counts.scans||0}}</b><span>scans</span></span>
         <span class="stat"><b>{{money(counts.cost_usd)}}</b><span>total spend</span></span>
-        <button class="primary" style="float:right" @click="pdf('/api/report.pdf')">Executive PDF (all)</button>
+        <div style="float:right;display:flex;gap:8px">
+          <button @click="pdf('/api/report.pdf')">Quick PDF (all)</button>
+          <button class="primary" @click="go('reports')">Reports →</button>
+        </div>
       </div>
       <div class="card">
         <div class="flex"><h2 style="margin-top:0">{{activeScans.length ? 'Active scans' : 'Recent scans'}}</h2>
@@ -533,12 +607,13 @@ createApp({
           <th @click="toggleSort('dash','severity')" style="cursor:pointer">Sev{{caret('dash','severity')}}</th>
           <th @click="toggleSort('dash','slug')" style="cursor:pointer">Project{{caret('dash','slug')}}</th>
           <th @click="toggleSort('dash','title')" style="cursor:pointer">Title{{caret('dash','title')}}</th>
+          <th @click="toggleSort('dash','last_seen')" style="cursor:pointer">Updated{{caret('dash','last_seen')}}</th>
           <th @click="toggleSort('dash','file')" style="cursor:pointer">Where{{caret('dash','file')}}</th></tr></thead>
         <tbody><tr v-for="f in sortRows(dashFindings,'dash').slice(0,25)" :key="f.id" :class="rowTri(f)" @click="openFinding(f); view='finding'" style="cursor:pointer">
           <td><span class="badge" :class="'b-'+f.severity">{{f.severity}}</span></td>
           <td class="muted">{{f.slug}}</td>
           <td>{{f.title}}<span v-if="f.triage && f.triage!=='unset'" class="tri" :class="'tri-'+f.triage">{{triageShort(f.triage)}}</span></td>
-          <td class="mono muted where">{{f.file}}{{f.line?':'+f.line:''}}</td></tr>
+          <td class="muted nowrap">{{fmt(f.last_seen)}}</td></tr>
           <tr v-if="!dashFindings.length"><td colspan="4" class="muted">{{hideFP && findings.length ? 'All open findings are marked false positive.' : 'No open findings.'}}</td></tr></tbody></table>
       </div>
     </div>
@@ -590,21 +665,44 @@ createApp({
         <div class="flex"><b>{{current.repo.url}}</b><span class="spacer"></span>
           <button class="sm" @click="editRepo(current.repo)">Edit</button>
           <button class="sm primary" @click="runScan(current.repo)">Scan now</button>
-          <button class="sm" @click="pdf('/api/report.pdf?repo_id='+current.repo.id)">Executive PDF</button></div>
+          <button class="sm" @click="generateReport(current.repo.id)">Generate report</button>
+          <button class="sm" @click="pdf('/api/report.pdf?repo_id='+current.repo.id)">Quick PDF</button></div>
         <div class="muted" style="margin-top:8px">cron {{current.repo.cron||'—'}} · next {{fmt(current.next_run)||'—'}} · {{current.repo.enabled?'enabled':'disabled'}}</div>
         <div v-if="current.repo.context" style="margin-top:8px"><span class="muted">context:</span> {{current.repo.context}}</div>
+      </div>
+      <div class="card">
+        <div class="flex" style="margin-bottom:6px"><h2 style="margin:0">Reports</h2>
+          <span v-if="repoReports(current.repo.id).some(r=>['queued','running'].includes(r.status))" class="live" style="font-size:13px"><span class="dot pulse on"></span>generating…</span>
+          <span class="spacer"></span>
+          <button class="sm primary" @click="generateReport(current.repo.id)">Generate report</button></div>
+        <div class="muted" style="font-size:12.5px;margin-bottom:8px">An AI-written executive report (what was checked · ideas · summary) with every finding as an advisory — code blocks and PoCs — in the JET format. Generation takes priority over pending scans.</div>
+        <table>
+          <thead><tr><th>Title</th><th>Status</th><th>Findings</th><th>Cost</th><th>Created</th><th></th></tr></thead>
+          <tbody>
+            <tr v-for="r in repoReports(current.repo.id)" :key="r.uuid" style="cursor:pointer" @click="r.status==='done' && openReport(r)">
+              <td>{{r.title}}</td>
+              <td><span class="pill" :class="r.status"><span v-if="['queued','running'].includes(r.status)" class="dot pulse on"></span>{{r.status}}</span>
+                <span v-if="r.error" class="muted" style="font-size:12px;display:block">{{r.error}}</span></td>
+              <td class="muted nowrap">{{r.summary || '—'}}</td>
+              <td class="nowrap">{{money(r.cost_usd)}}</td>
+              <td class="muted nowrap">{{fmt(r.created)}}</td>
+              <td class="nowrap right">
+                <button class="sm" :disabled="r.status!=='done'" @click.stop="pdf('/api/reports/'+r.uuid+'.pdf')">PDF</button>
+                <button class="sm" :disabled="r.status!=='done'" @click.stop="pdf('/api/reports/'+r.uuid+'.md')">MD</button>
+                <button class="sm danger" :disabled="['queued','running'].includes(r.status)" @click.stop="deleteReport(r)">✕</button></td></tr>
+            <tr v-if="!repoReports(current.repo.id).length"><td colspan="6" class="muted">No reports yet — click Generate report.</td></tr>
+          </tbody></table>
       </div>
       <div class="card"><h2>Findings</h2><table>
         <thead><tr>
           <th @click="toggleSort('rfind','severity')" style="cursor:pointer">Sev{{caret('rfind','severity')}}</th>
           <th @click="toggleSort('rfind','title')" style="cursor:pointer">Title{{caret('rfind','title')}}</th>
-          <th @click="toggleSort('rfind','file')" style="cursor:pointer">Where{{caret('rfind','file')}}</th>
           <th @click="toggleSort('rfind','status')" style="cursor:pointer">Status{{caret('rfind','status')}}</th></tr></thead>
         <tbody><tr v-for="f in sortRows(current.findings,'rfind')" :key="f.id" :class="rowTri(f)" style="cursor:pointer" @click="openFinding(f); view='finding'">
           <td><span class="badge" :class="'b-'+f.severity">{{f.severity}}</span></td>
-          <td>{{f.title}}</td><td class="mono muted where">{{f.file}}{{f.line?':'+f.line:''}}</td>
+          <td>{{f.title}}</td>
           <td><span class="pill" :class="f.status">{{f.status}}</span></td></tr>
-          <tr v-if="!current.findings.length"><td colspan="4" class="muted">No findings recorded yet.</td></tr></tbody></table></div>
+          <tr v-if="!current.findings.length"><td colspan="3" class="muted">No findings recorded yet.</td></tr></tbody></table></div>
       <div class="card"><h2>Scan history</h2><table>
         <thead><tr>
           <th @click="toggleSort('rscan','id')" style="cursor:pointer">#{{caret('rscan','id')}}</th>
@@ -642,17 +740,15 @@ createApp({
           <th @click="toggleSort('findings','severity')" style="cursor:pointer">Sev{{caret('findings','severity')}}</th>
           <th @click="toggleSort('findings','slug')" style="cursor:pointer">Project{{caret('findings','slug')}}</th>
           <th @click="toggleSort('findings','title')" style="cursor:pointer">Title{{caret('findings','title')}}</th>
-          <th @click="toggleSort('findings','file')" style="cursor:pointer">Where{{caret('findings','file')}}</th>
           <th @click="toggleSort('findings','status')" style="cursor:pointer">Status{{caret('findings','status')}}</th>
           <th @click="toggleSort('findings','last_seen')" style="cursor:pointer">Seen{{caret('findings','last_seen')}}</th></tr></thead>
         <tbody><tr v-for="f in pageSlice(sortRows(triageFiltered(findings),'findings'),'findings')" :key="f.id" :class="rowTri(f)" style="cursor:pointer" @click="openFinding(f); view='finding'">
           <td><span class="badge" :class="'b-'+f.severity">{{f.severity}}</span></td>
           <td class="muted">{{f.slug}}</td><td>{{f.title}}</td>
-          <td class="mono muted where">{{f.file}}{{f.line?':'+f.line:''}}</td>
           <td><span class="stwrap"><span class="pill" :class="f.status">{{f.status}}</span>
             <span v-if="f.triage && f.triage!=='unset'" class="tri" :class="'tri-'+f.triage">{{triageShort(f.triage)}}</span></span></td>
           <td class="muted nowrap">{{fmt(f.last_seen)}}</td></tr>
-          <tr v-if="!triageFiltered(findings).length"><td colspan="6" class="muted">No findings.</td></tr></tbody></table>
+          <tr v-if="!triageFiltered(findings).length"><td colspan="5" class="muted">No findings.</td></tr></tbody></table>
         <div class="pager" v-if="triageFiltered(findings).length">
           <span class="muted">Rows</span>
           <select style="width:auto" v-model="pageState.findings.size" @change="pageState.findings.page=1"><option v-for="n in pageSizes" :key="n" :value="n">{{n}}</option></select>
@@ -707,7 +803,62 @@ createApp({
           <span class="muted" style="font-size:12px;margin-left:8px">Ctrl+Enter</span></div>
       </div>
 
-      <div class="card"><h2 style="margin-top:0">Advisory</h2><pre>{{finding._md}}</pre></div>
+      <div class="card">
+        <div class="flex" style="margin-bottom:8px"><h2 style="margin:0">Advisory</h2><span class="spacer"></span>
+          <label class="switch"><input type="checkbox" v-model="mdRender"><span class="track"></span>Rendered</label></div>
+        <div v-if="mdRender" class="md" v-html="finding._html"></div>
+        <pre v-else>{{finding._md}}</pre>
+      </div>
+    </div>
+
+    <!-- REPORTS (list) -->
+    <div v-if="view=='reports' && !reportView">
+      <div class="card">
+        <div class="flex"><h2 style="margin-top:0">Executive reports</h2>
+          <span v-if="pendingReport" class="live" style="font-size:13px"><span class="dot pulse on"></span>generating…</span>
+          <span class="spacer"></span>
+          <button class="primary" @click="generateReport(null)">Generate portfolio report</button></div>
+        <div class="muted" style="font-size:12.5px;margin-top:6px">A shareable, AI-written report for leadership (CISO / CTO / managers): <b>what was checked</b>, <b>ideas &amp; recommendations</b>, and an <b>executive summary</b> — followed by every finding as an advisory with code blocks and PoCs, in the JET format. Open a repository to generate a report scoped to just that repo. Report generation <b>takes priority</b> over pending scans.</div>
+        <div class="err" v-if="reportMsg" style="margin-top:8px">{{reportMsg}}</div>
+      </div>
+      <div class="card"><table>
+        <thead><tr>
+          <th @click="toggleSort('reports','scope')" style="cursor:pointer">Scope{{caret('reports','scope')}}</th>
+          <th @click="toggleSort('reports','title')" style="cursor:pointer">Title{{caret('reports','title')}}</th>
+          <th @click="toggleSort('reports','status')" style="cursor:pointer">Status{{caret('reports','status')}}</th>
+          <th>Findings</th>
+          <th @click="toggleSort('reports','created')" style="cursor:pointer">Created{{caret('reports','created')}}</th><th></th></tr></thead>
+        <tbody>
+          <tr v-for="r in sortRows(reports,'reports')" :key="r.uuid" style="cursor:pointer" @click="r.status==='done' && openReport(r)">
+            <td>{{reportRepoName(r)}}</td>
+            <td>{{r.title}}</td>
+            <td><span class="pill" :class="r.status"><span v-if="['queued','running'].includes(r.status)" class="dot pulse on"></span>{{r.status}}</span>
+              <span v-if="r.error" class="muted" style="font-size:12px;display:block">{{r.error}}</span></td>
+            <td class="muted">{{r.summary || '—'}}</td>
+            <td class="muted nowrap">{{fmt(r.created)}}</td>
+            <td class="nowrap right">
+              <button class="sm" :disabled="r.status!=='done'" @click.stop="pdf('/api/reports/'+r.uuid+'.pdf')">PDF</button>
+              <button class="sm" :disabled="r.status!=='done'" @click.stop="pdf('/api/reports/'+r.uuid+'.md')">MD</button>
+              <button class="sm danger" :disabled="['queued','running'].includes(r.status)" @click.stop="deleteReport(r)">✕</button></td></tr>
+          <tr v-if="!reports.length"><td colspan="6" class="muted">No reports yet — click Generate portfolio report, or open a repository and generate one there.</td></tr>
+        </tbody></table></div>
+    </div>
+
+    <!-- REPORT DETAIL -->
+    <div v-if="view=='reports' && reportView">
+      <div style="margin-bottom:10px"><a @click="closeReport()">← reports</a></div>
+      <div class="card">
+        <div class="flex"><b>{{reportView.title}}</b><span class="spacer"></span>
+          <button class="sm primary" @click="pdf('/api/reports/'+reportView.uuid+'.pdf')">Download PDF</button>
+          <button class="sm" @click="pdf('/api/reports/'+reportView.uuid+'.md')">Download .md</button></div>
+        <div class="muted" style="margin-top:8px">{{reportRepoName(reportView)}} · {{reportView.summary}} · model {{reportView.model||'—'}} · {{money(reportView.cost_usd)}} · {{fmt(reportView.created)}}</div>
+      </div>
+      <div class="card">
+        <div class="flex" style="margin-bottom:8px"><h2 style="margin:0">Report</h2><span class="spacer"></span>
+          <label class="switch"><input type="checkbox" v-model="mdRender"><span class="track"></span>Rendered</label></div>
+        <div v-if="mdRender" class="md" v-html="reportView._html"></div>
+        <pre v-else>{{reportView.markdown}}</pre>
+      </div>
     </div>
 
     <!-- SCANS -->
@@ -813,6 +964,15 @@ createApp({
           <input type="number" min="1" v-model.number="settings.max_concurrent_scans"></div>
         <div class="muted" style="font-size:12px;margin-top:6px">How many repositories scan in parallel. Each scan is a full orchestrator + LLM session — raise it only if the host can handle it.</div>
         <div style="margin-top:12px"><button class="primary" @click="saveSettings">Save</button> <span class="ok" v-if="settingsMsg">{{settingsMsg}}</span></div>
+      </div>
+      <div class="card" v-if="settings.schema">
+        <h2>Database</h2>
+        <div class="muted" style="font-size:13px">Schema <b style="color:var(--fg)">v{{settings.schema.version}}</b> of <b style="color:var(--fg)">v{{settings.schema.target}}</b>. Migrations are applied automatically on startup against whichever <span class="mono">/data</span> folder is mounted — point the app at any folder and it runs only what that database is missing.</div>
+        <div class="muted" style="font-size:12px;margin-top:6px" v-if="settings.schema.version > settings.schema.target">⚠ This database was written by a newer build (v{{settings.schema.version}}). Update this build if anything looks off.</div>
+        <table style="margin-top:8px" v-if="settings.schema.applied && settings.schema.applied.length">
+          <thead><tr><th>Ver</th><th>Migration</th><th>Applied</th></tr></thead>
+          <tbody><tr v-for="m in settings.schema.applied" :key="m.version"><td>v{{m.version}}</td><td>{{m.name}}</td><td class="muted nowrap">{{fmt(m.applied_at)}}</td></tr></tbody>
+        </table>
       </div>
       <div class="card"><h2>AI configuration — one template for all repositories</h2>
         <div class="muted" style="font-size:12px;margin-bottom:8px">Backend, model, keys and args used for <b>every</b> scan. Repositories only choose what to scan, when, and their context.</div>
@@ -927,7 +1087,7 @@ createApp({
     <table><thead><tr><th>Sev</th><th>Title</th><th>Where</th><th>Status</th></tr></thead>
       <tbody><tr v-for="f in scanView.findings" :key="f.uuid||f.id" :class="rowTri(f)" style="cursor:pointer" @click="openFindingFromScan(f)">
         <td><span class="badge" :class="'b-'+f.severity">{{f.severity}}</span></td>
-        <td>{{f.title}}</td><td class="mono muted where">{{f.file}}{{f.line?':'+f.line:''}}</td>
+        <td>{{f.title}}</td>
         <td><span class="stwrap"><span class="pill" :class="f.status">{{f.status}}</span>
           <span v-if="f.triage && f.triage!=='unset'" class="tri" :class="'tri-'+f.triage">{{triageShort(f.triage)}}</span></span></td></tr></tbody></table>
   </div>

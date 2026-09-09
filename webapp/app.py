@@ -214,7 +214,8 @@ async def ws_auth(ws: WebSocket):
 @app.get("/api/settings")
 def get_settings(user: str = Depends(require_user)):
     return {"defaults": db.get_setting("defaults", DEFAULT_DEFAULTS),
-            "max_concurrent_scans": int(db.get_setting("max_concurrent_scans", 1) or 1)}
+            "max_concurrent_scans": int(db.get_setting("max_concurrent_scans", 1) or 1),
+            "schema": db.schema_info()}
 
 
 @app.put("/api/settings")
@@ -430,7 +431,9 @@ def finding_detail(fid: str, user: str = Depends(require_user)):
     f = db.get_finding(fid)
     if not f:
         raise HTTPException(404, "no such finding")
-    return {"finding": f, "advisory_markdown": reports.advisory_markdown(f),
+    md = reports.advisory_markdown(f)
+    return {"finding": f, "advisory_markdown": md,
+            "advisory_html": reports.markdown_fragment(md),
             "comments": db.list_comments(f["uuid"]),
             "review_hints": db.review_hints(f),
             "triage_values": db.TRIAGE_VALUES, "triage_labels": db.TRIAGE_LABEL}
@@ -443,10 +446,11 @@ async def set_finding_triage(fid: str, request: Request, user: str = Depends(req
         raise HTTPException(404, "no such finding")
     body = await request.json()
     try:
-        db.set_triage(f["uuid"], (body.get("triage") or "unset"), body.get("note") or "", user)
+        status = db.set_triage(f["uuid"], (body.get("triage") or "unset"),
+                               body.get("note") or "", user)
     except ValueError as e:
         raise HTTPException(400, str(e))
-    return {"ok": True}
+    return {"ok": True, "status": status}
 
 
 @app.post("/api/findings/{fid}/comments")
@@ -484,6 +488,77 @@ def exec_report_pdf(repo_id: int | None = None, user: str = Depends(require_user
     tag = f"repo-{repo_id}" if repo_id else "all"
     return Response(pdf, media_type="application/pdf",
                     headers={"Content-Disposition": f'attachment; filename="exec-{tag}.pdf"'})
+
+
+# --- reports (AI-written, JET-format, priority-queued, downloadable) --------
+
+@app.post("/api/reports/generate")
+def generate_report(repo_id: int | None = None, user: str = Depends(require_user)):
+    """Queue an executive report. repo_id omitted = portfolio (all repos). The
+    report job takes priority over pending scans."""
+    if repo_id is not None and not db.get_repo(repo_id):
+        raise HTTPException(404, "no such repo")
+    return {"ok": True, "report": runner.enqueue_report(repo_id, "manual")}
+
+
+@app.post("/api/repos/{rid}/report")
+def generate_repo_report(rid: int, user: str = Depends(require_user)):
+    if not db.get_repo(rid):
+        raise HTTPException(404, "no such repo")
+    return {"ok": True, "report": runner.enqueue_report(rid, "manual")}
+
+
+@app.get("/api/reports")
+def list_reports(repo_id: int | None = None, user: str = Depends(require_user)):
+    return {"reports": db.list_reports(repo_id=repo_id), "runner": runner.status()}
+
+
+def _report_ready(uuid: str) -> dict:
+    r = db.get_report_by_uuid(uuid)
+    if not r:
+        raise HTTPException(404, "no such report")
+    if r["status"] != "done" or not (r.get("markdown") or "").strip():
+        raise HTTPException(409, f"report is not ready (status: {r['status']})")
+    return r
+
+
+# NOTE: the .pdf / .md download routes MUST be declared before the bare
+# /api/reports/{uuid} detail route — a str path param matches dots too, so the
+# bare route would otherwise capture "<uuid>.pdf" as the uuid.
+@app.get("/api/reports/{uuid}.md")
+def report_md(uuid: str, user: str = Depends(require_user)):
+    r = _report_ready(uuid)
+    name = (r.get("slug") or "portfolio").replace("/", "_")
+    return Response(r["markdown"], media_type="text/markdown; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="report-{name}-{uuid}.md"'})
+
+
+@app.get("/api/reports/{uuid}.pdf")
+def report_pdf(uuid: str, user: str = Depends(require_user)):
+    r = _report_ready(uuid)
+    name = (r.get("slug") or "portfolio").replace("/", "_")
+    pdf = reports.report_pdf(r)
+    return Response(pdf, media_type="application/pdf",
+                    headers={"Content-Disposition": f'attachment; filename="report-{name}-{uuid}.pdf"'})
+
+
+@app.get("/api/reports/{uuid}")
+def report_detail(uuid: str, user: str = Depends(require_user)):
+    r = db.get_report_by_uuid(uuid)
+    if not r:
+        raise HTTPException(404, "no such report")
+    return {"report": r, "html": reports.markdown_fragment(r.get("markdown") or "")}
+
+
+@app.delete("/api/reports/{uuid}")
+def remove_report(uuid: str, user: str = Depends(require_user)):
+    r = db.get_report_by_uuid(uuid)
+    if not r:
+        raise HTTPException(404, "no such report")
+    if r["status"] in ("queued", "running"):
+        raise HTTPException(409, "cannot delete a report that is queued or running")
+    db.delete_report(r["id"])
+    return {"ok": True}
 
 
 # --- static SPA -------------------------------------------------------------

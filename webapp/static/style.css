@@ -117,6 +117,31 @@ tr.row-duplicate:hover td{background:rgba(140,140,150,.17)}
   padding:20px;width:min(560px,92vw);max-height:88vh;overflow:auto}
 pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:14px;
   overflow:auto;font-family:"SF Mono",Consolas,monospace;font-size:13.5px;line-height:1.5;white-space:pre-wrap}
+
+/* rendered markdown (advisory + report viewers) — dark-theme styling of the
+   server-rendered HTML fragment shown when the "Rendered" toggle is on */
+.md{font-size:15px;line-height:1.6;word-wrap:break-word}
+.md>*:first-child{margin-top:0}
+.md h1{font-size:20px;margin:20px 0 8px;border-bottom:1px solid var(--line);padding-bottom:4px}
+.md h2{font-size:17px;margin:16px 0 7px;color:var(--accent)}
+.md h3{font-size:15px;margin:13px 0 5px}
+.md p,.md li{margin:6px 0}
+.md code{font-family:"SF Mono",Consolas,monospace;font-size:13px;background:var(--bg);
+  border:1px solid var(--line);border-radius:4px;padding:1px 5px}
+.md pre{background:var(--bg);border:1px solid var(--line);border-left:3px solid var(--accent2);
+  border-radius:8px;padding:12px 14px;overflow:auto;white-space:pre-wrap;word-break:break-word}
+.md pre code{background:none;border:none;padding:0;font-size:13px}
+.md blockquote{margin:10px 0;padding:8px 14px;border-left:3px solid var(--accent2);
+  background:var(--panel2);border-radius:0 6px 6px 0}
+.md table{width:100%;border-collapse:collapse;font-size:14px;margin:10px 0}
+.md th{background:var(--panel2);text-align:left;padding:6px 8px;border:1px solid var(--line)}
+.md td{padding:6px 8px;border:1px solid var(--line);vertical-align:top}
+.md hr{border:none;border-top:1px solid var(--line);margin:16px 0}
+.md .badge{display:inline-block;padding:1px 8px;border-radius:12px;font-size:12px;font-weight:700;color:#17130c}
+.md .badge.CRITICAL{background:var(--crit);color:#fff} .md .badge.HIGH{background:var(--high)}
+.md .badge.MEDIUM{background:var(--med)} .md .badge.LOW{background:var(--low);color:#fff}
+.md .badge.SAFE{background:var(--ok);color:#fff}
+.md .page-break{display:none}
 .log{max-height:60vh;overflow:auto}
 .right{text-align:right} .flex{display:flex;gap:8px;align-items:center}
 .spacer{flex:1}
