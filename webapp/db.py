@@ -94,6 +94,28 @@ def _migration_0001_baseline() -> None:
                 content TEXT NOT NULL DEFAULT '', enabled INTEGER DEFAULT 1,
                 created TEXT, updated TEXT
             );
+            CREATE TABLE IF NOT EXISTS projects (
+                id INTEGER PRIMARY KEY, name TEXT NOT NULL,
+                instructions TEXT NOT NULL DEFAULT '', created TEXT, updated TEXT
+            );
+            CREATE TABLE IF NOT EXISTS service_cards (
+                repo_id INTEGER PRIMARY KEY, slug TEXT, card_json TEXT, updated TEXT,
+                FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS reports (
+                id INTEGER PRIMARY KEY, uuid TEXT UNIQUE,
+                repo_id INTEGER,                     -- NULL = portfolio (all repos)
+                slug TEXT, title TEXT, scope TEXT,   -- scope = human label ("all repositories" | slug)
+                status TEXT DEFAULT 'queued',        -- queued|running|done|error
+                trigger TEXT DEFAULT 'manual',
+                markdown TEXT DEFAULT '',            -- the full report artifact (narrative + appendix)
+                summary TEXT,                        -- one-line AI summary, for the list
+                model TEXT, cost_usd REAL DEFAULT 0, error TEXT,
+                findings_count INTEGER DEFAULT 0,
+                sev_json TEXT DEFAULT '{}',          -- {severity: n} snapshot for stat tiles
+                created TEXT, started TEXT, finished TEXT,
+                FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+            );
             CREATE INDEX IF NOT EXISTS idx_find_repo ON findings(repo_id);
             CREATE INDEX IF NOT EXISTS idx_find_sev  ON findings(severity);
             CREATE INDEX IF NOT EXISTS idx_scan_repo ON scans(repo_id);
@@ -155,8 +177,48 @@ def _migration_0001_baseline() -> None:
 # `(<next int>, "<what it does>", <fn>)` to _MIGRATIONS. Nothing else to bump — the
 # target version is simply the highest entry.
 
+def _migration_0002_reconcile_feature_tables() -> None:
+    """Recovery migration. A bad merge once dropped three tables from the baseline
+    (`projects`, `service_cards`, `reports`) while keeping the index that references
+    `reports` — so some DBs recorded a baseline that never created them. This re-creates
+    all three (and the repos.project_id column) idempotently, so ANY database — one from
+    the good baseline, or one from that partial baseline — converges to the same schema."""
+    with connect() as c:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS projects (
+                id INTEGER PRIMARY KEY, name TEXT NOT NULL,
+                instructions TEXT NOT NULL DEFAULT '', created TEXT, updated TEXT
+            );
+            CREATE TABLE IF NOT EXISTS service_cards (
+                repo_id INTEGER PRIMARY KEY, slug TEXT, card_json TEXT, updated TEXT,
+                FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS reports (
+                id INTEGER PRIMARY KEY, uuid TEXT UNIQUE,
+                repo_id INTEGER,
+                slug TEXT, title TEXT, scope TEXT,
+                status TEXT DEFAULT 'queued',
+                trigger TEXT DEFAULT 'manual',
+                markdown TEXT DEFAULT '',
+                summary TEXT,
+                model TEXT, cost_usd REAL DEFAULT 0, error TEXT,
+                findings_count INTEGER DEFAULT 0,
+                sev_json TEXT DEFAULT '{}',
+                created TEXT, started TEXT, finished TEXT,
+                FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_report_repo ON reports(repo_id);
+            """
+        )
+        if "project_id" not in {r["name"] for r in c.execute("PRAGMA table_info(repos)")}:
+            c.execute("ALTER TABLE repos ADD COLUMN project_id INTEGER")
+
+
 _MIGRATIONS = [
     (1, "baseline schema", _migration_0001_baseline),
+    (2, "reconcile feature tables (projects, service_cards, reports)",
+     _migration_0002_reconcile_feature_tables),
 ]
 SCHEMA_VERSION = _MIGRATIONS[-1][0]
 

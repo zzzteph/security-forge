@@ -1087,7 +1087,7 @@ createApp({
     <table><thead><tr><th>Sev</th><th>Title</th><th>Where</th><th>Status</th></tr></thead>
       <tbody><tr v-for="f in scanView.findings" :key="f.uuid||f.id" :class="rowTri(f)" style="cursor:pointer" @click="openFindingFromScan(f)">
         <td><span class="badge" :class="'b-'+f.severity">{{f.severity}}</span></td>
-        <td>{{f.title}}</td>
+        <td>{{f.title}}</td><td class="mono muted where">{{f.file}}{{f.line?':'+f.line:''}}</td>
         <td><span class="stwrap"><span class="pill" :class="f.status">{{f.status}}</span>
           <span v-if="f.triage && f.triage!=='unset'" class="tri" :class="'tri-'+f.triage">{{triageShort(f.triage)}}</span></span></td></tr></tbody></table>
   </div>
