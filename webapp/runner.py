@@ -67,6 +67,16 @@ def _load_findings(slug: str) -> list[dict]:
     return list(data.values()) if isinstance(data, dict) else []
 
 
+def _load_model(slug: str) -> dict | None:
+    p = DATA_ROOT / "knowledge" / slug / "model.json"
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
 def _run_scan(repo_id: int, scan_id: int) -> None:
     repo = db.get_repo(repo_id)
     if not repo:
@@ -109,18 +119,29 @@ def _run_scan(repo_id: int, scan_id: int) -> None:
     # SECFORGE_EXTRA_CONTEXT (the orchestrator folds it into the scan prompt as
     # authoritative user context) so the agent triages consistently and stops
     # re-reporting findings a human already dismissed as false positives.
+    # Assemble the authoritative operator context, broadest scope first: enabled
+    # skills (global) -> project instructions (group) -> repo context (one) ->
+    # triage decisions + comments (per finding). All are handed to the agent via
+    # SECFORGE_EXTRA_CONTEXT and echoed into the scan log below so it's auditable.
     ctx_parts = []
     skills = db.enabled_skills_text()          # operator-uploaded .md playbooks
     if skills:
         ctx_parts.append(skills)
+    proj = db.project_instructions(repo_id)    # shared instructions from the repo's project
+    if proj:
+        ctx_parts.append(proj)
+    smap = db.project_service_map(repo_id)     # sibling services' cards (shared knowledge, not code)
+    if smap:
+        ctx_parts.append(smap)
     if (repo.get("context") or "").strip():
         ctx_parts.append(repo["context"].strip())
-    triage_ctx = db.triage_context(repo_id)
+    triage_ctx = db.triage_context(repo_id)    # prior triage + operator comments
     if triage_ctx:
         ctx_parts.append(triage_ctx)
     if ctx_parts:
         env["SECFORGE_EXTRA_CONTEXT"] = "\n\n".join(ctx_parts)
     # Global AI env (provider keys, base URLs, SECFORGE_LLM_API_KEY, …) for every scan.
+    _ctx_dbg = env.get("SECFORGE_EXTRA_CONTEXT", "")
     try:
         for e in (cfg.get("env") or []):
             k = (e.get("key") or "").strip()
@@ -130,6 +151,16 @@ def _run_scan(repo_id: int, scan_id: int) -> None:
         pass
 
     db.append_scan_log(scan_id, f"$ {' '.join(shlex.quote(x) for x in cmd)}\n\n")
+    # Audit trail: record EXACTLY what operator context was handed to the agent, so
+    # you can confirm skills / project / repo context / triage + comments went in.
+    if _ctx_dbg:
+        db.append_scan_log(scan_id, "===== operator context injected into this scan "
+                           "(skills -> project -> repo context -> triage & comments) "
+                           "=====\n" + _ctx_dbg + "\n===== end operator context =====\n\n")
+    else:
+        db.append_scan_log(scan_id, "[runner] NOTE: no operator context for this scan "
+                           "(no enabled skills, no project instructions, no repo "
+                           "context, no prior triage/comments).\n\n")
     db.update_scan(scan_id, heartbeat=db._now())
     commit = None
     orch_error: str | None = None   # a repo-level failure the orchestrator printed
@@ -188,6 +219,15 @@ def _run_scan(repo_id: int, scan_id: int) -> None:
 
     findings = _load_findings(slug)
     stats = db.reconcile_findings(repo_id, slug, scan_id, findings, commit)
+    # Harvest this repo's SERVICE CARD (exposes / auth / outbound calls) from its
+    # recon model into the project's shared knowledge — so sibling scans can validate
+    # against what this service declares, without ever cloning its code.
+    _model = _load_model(slug)
+    if _model:
+        try:
+            db.upsert_service_card(repo_id, slug, db.build_card_from_model(_model))
+        except Exception:  # noqa: BLE001  (card harvest must never fail a scan)
+            pass
     db.update_scan(scan_id, status="done", finished=db._now(), commit_sha=commit,
                    new_count=stats["new"], mitigated_count=stats["mitigated"],
                    total_count=stats["total"], cost_usd=cost, error=None)

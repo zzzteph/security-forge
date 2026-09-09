@@ -266,6 +266,43 @@ def remove_skill(sid: int, user: str = Depends(require_user)):
     return {"ok": True}
 
 
+# --- projects (a group of repos sharing inherited ground-truth instructions) ------
+
+@app.get("/api/projects")
+def projects(user: str = Depends(require_user)):
+    return {"projects": db.list_projects()}
+
+
+@app.get("/api/projects/{pid}")
+def project_detail(pid: int, user: str = Depends(require_user)):
+    p = db.get_project(pid)
+    if not p:
+        raise HTTPException(404, "no such project")
+    return p
+
+
+@app.post("/api/projects")
+async def create_project(request: Request, user: str = Depends(require_user)):
+    body = await request.json()
+    if not (body.get("name") or "").strip():
+        raise HTTPException(400, "name required")
+    return {"ok": True, "id": db.upsert_project(body)}
+
+
+@app.put("/api/projects/{pid}")
+async def update_project(pid: int, request: Request, user: str = Depends(require_user)):
+    if not db.get_project(pid):
+        raise HTTPException(404, "no such project")
+    db.upsert_project(await request.json(), pid)
+    return {"ok": True}
+
+
+@app.delete("/api/projects/{pid}")
+def remove_project(pid: int, user: str = Depends(require_user)):
+    db.delete_project(pid)
+    return {"ok": True}
+
+
 # --- repos ------------------------------------------------------------------
 
 @app.get("/api/repos")
@@ -395,6 +432,7 @@ def finding_detail(fid: str, user: str = Depends(require_user)):
         raise HTTPException(404, "no such finding")
     return {"finding": f, "advisory_markdown": reports.advisory_markdown(f),
             "comments": db.list_comments(f["uuid"]),
+            "review_hints": db.review_hints(f),
             "triage_values": db.TRIAGE_VALUES, "triage_labels": db.TRIAGE_LABEL}
 
 

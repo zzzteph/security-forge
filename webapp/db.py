@@ -90,6 +90,14 @@ def init() -> None:
                 content TEXT NOT NULL DEFAULT '', enabled INTEGER DEFAULT 1,
                 created TEXT, updated TEXT
             );
+            CREATE TABLE IF NOT EXISTS projects (
+                id INTEGER PRIMARY KEY, name TEXT NOT NULL,
+                instructions TEXT NOT NULL DEFAULT '', created TEXT, updated TEXT
+            );
+            CREATE TABLE IF NOT EXISTS service_cards (
+                repo_id INTEGER PRIMARY KEY, slug TEXT, card_json TEXT, updated TEXT,
+                FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+            );
             CREATE INDEX IF NOT EXISTS idx_find_repo ON findings(repo_id);
             CREATE INDEX IF NOT EXISTS idx_find_sev  ON findings(severity);
             CREATE INDEX IF NOT EXISTS idx_scan_repo ON scans(repo_id);
@@ -103,6 +111,9 @@ def init() -> None:
                           ("env_json", "TEXT DEFAULT '[]'")]:
             if name not in cols:
                 c.execute(f"ALTER TABLE repos ADD COLUMN {name} {ddl}")
+        # Migration: a repo can belong to a project (shared, inherited instructions).
+        if "project_id" not in cols:
+            c.execute("ALTER TABLE repos ADD COLUMN project_id INTEGER")
         # Migration: per-scan liveness marker (updated on every log flush) so the UI
         # can show a heartbeat / "last output N s ago" while a scan is running.
         scols = {r["name"] for r in c.execute("PRAGMA table_info(scans)")}
@@ -248,6 +259,7 @@ def upsert_repo(data: dict, rid: int | None = None) -> int:
         "cron": (data.get("cron") or "").strip(),
         "enabled": 1 if data.get("enabled", True) else 0,
         "context": data.get("context") or "",
+        "project_id": _int(data.get("project_id")),
         "updated": _now(),
     }
     with connect() as c:
@@ -571,6 +583,149 @@ def enabled_skills_text(per_skill_cap: int = 12000) -> str:
     return "\n".join(parts)
 
 
+# --- projects (a group of repos sharing inherited ground-truth instructions) -----
+
+def list_projects() -> list[dict]:
+    with connect() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT p.id, p.name, p.instructions, p.updated, "
+            "(SELECT COUNT(*) FROM repos r WHERE r.project_id=p.id) AS repo_count "
+            "FROM projects p ORDER BY p.name")]
+
+
+def get_project(pid: int) -> dict | None:
+    with connect() as c:
+        r = c.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
+        if not r:
+            return None
+        d = dict(r)
+        d["repos"] = [dict(x) for x in c.execute(
+            "SELECT id, slug FROM repos WHERE project_id=? ORDER BY slug", (pid,))]
+        return d
+
+
+def upsert_project(data: dict, pid: int | None = None) -> int:
+    name = (data.get("name") or "project").strip()[:120]
+    instr = data.get("instructions") or ""
+    with connect() as c:
+        if pid:
+            c.execute("UPDATE projects SET name=?, instructions=?, updated=? WHERE id=?",
+                      (name, instr, _now(), pid))
+            return pid
+        cur = c.execute("INSERT INTO projects(name,instructions,created,updated) "
+                        "VALUES(?,?,?,?)", (name, instr, _now(), _now()))
+        return cur.lastrowid
+
+
+def delete_project(pid: int) -> None:
+    with connect() as c:
+        c.execute("UPDATE repos SET project_id=NULL WHERE project_id=?", (pid,))
+        c.execute("DELETE FROM projects WHERE id=?", (pid,))
+
+
+def build_card_from_model(model: dict) -> dict:
+    """Distill a repo's recon model.json into a compact SERVICE CARD — what it
+    exposes, how it authenticates/authorizes, and (the cross-service key) what it
+    CALLS. This is the shared knowledge a project accumulates; the code is never
+    shared, only these cards."""
+    exposes = []
+    for e in (model.get("entrypoints") or [])[:300]:
+        if isinstance(e, dict):
+            exposes.append({"method": e.get("method") or e.get("kind") or "",
+                            "route": e.get("route") or e.get("id") or "",
+                            "auth_required": e.get("auth_required"),
+                            "roles": e.get("roles") or []})
+    auth = model.get("auth") or {}
+    raw_calls = (model.get("calls") or model.get("dependencies")
+                 or model.get("outbound_calls") or model.get("outbound") or [])
+    calls = []
+    for c in (raw_calls if isinstance(raw_calls, list) else [])[:200]:
+        if isinstance(c, str):
+            calls.append({"target": c})
+        elif isinstance(c, dict):
+            calls.append({k: c.get(k) for k in ("target", "kind", "where", "auth_sent")
+                          if c.get(k)})
+    return {"idea": (model.get("idea") or "")[:400],
+            "authn": auth.get("authn") or {}, "authz": auth.get("authz") or {},
+            "exposes": exposes, "calls": calls, "provides": model.get("provides") or [],
+            "built_commit": model.get("last_analyzed_commit") or model.get("built_commit")}
+
+
+def upsert_service_card(repo_id: int, slug: str, card: dict) -> None:
+    cj = json.dumps(card, ensure_ascii=False)
+    with connect() as c:
+        c.execute("INSERT INTO service_cards(repo_id,slug,card_json,updated) "
+                  "VALUES(?,?,?,?) ON CONFLICT(repo_id) DO UPDATE SET "
+                  "slug=excluded.slug, card_json=excluded.card_json, updated=excluded.updated",
+                  (repo_id, slug, cj, _now()))
+
+
+def _card_to_prose(slug: str, card: dict) -> str:
+    out = [f"### {slug}"]
+    if card.get("idea"):
+        out.append(f"  purpose: {card['idea']}")
+    ex = card.get("exposes") or []
+    if ex:
+        shown = "; ".join(
+            f"{(e.get('method') or '').upper()} {e.get('route') or ''}"
+            + (" [auth]" if e.get("auth_required") else " [NO auth]"
+               if e.get("auth_required") is False else "")
+            + (f" roles={','.join(e['roles'])}" if e.get("roles") else "")
+            for e in ex[:40])
+        out.append(f"  exposes: {shown}" + (f"  (+{len(ex) - 40} more)" if len(ex) > 40 else ""))
+    authn, authz = card.get("authn") or {}, card.get("authz") or {}
+    if authn.get("mechanism") or authz.get("model"):
+        out.append(f"  auth: authn={authn.get('mechanism', '?')}; authz={authz.get('model', '?')}"
+                   + (f"; enforced_at={authz.get('enforced_at')}" if authz.get("enforced_at") else ""))
+    if card.get("calls"):
+        out.append("  calls (outbound): " + ", ".join(
+            x.get("target", "?") for x in card["calls"][:40]))
+    if card.get("provides"):
+        out.append(f"  provides: {card['provides']}")
+    return "\n".join(out)
+
+
+def project_service_map(repo_id: int) -> str:
+    """The OTHER services in this repo's project, as cards, for injection into the
+    scan context — so a service is validated against what its neighbors DECLARE
+    (auth, exposure, outbound calls) without cloning their code."""
+    with connect() as c:
+        r = c.execute("SELECT project_id FROM repos WHERE id=?", (repo_id,)).fetchone()
+        if not r or r["project_id"] is None:
+            return ""
+        rows = [dict(x) for x in c.execute(
+            "SELECT sc.slug AS slug, sc.card_json AS card_json FROM service_cards sc "
+            "JOIN repos rp ON rp.id = sc.repo_id "
+            "WHERE rp.project_id=? AND sc.repo_id != ?", (r["project_id"], repo_id))]
+    if not rows:
+        return ""
+    parts = ["PROJECT SERVICE MAP — the OTHER services in this project (shared knowledge, "
+             "NOT their code). Use them to resolve cross-service auth and reachability: if "
+             "this service calls one listed below, trust its declared auth/exposure and do "
+             "not re-flag it; a call to a service NOT listed here is UNMODELED — say so "
+             "rather than assume it's unprotected."]
+    for row in rows:
+        try:
+            parts.append(_card_to_prose(row["slug"], json.loads(row["card_json"])))
+        except (ValueError, TypeError):
+            continue
+    return "\n".join(parts)
+
+
+def project_instructions(repo_id: int) -> str:
+    """The instructions of the project this repo belongs to (shared across members),
+    for injection into the repo's scan context. Empty if it has no project."""
+    with connect() as c:
+        r = c.execute("SELECT p.name, p.instructions FROM repos rp "
+                      "JOIN projects p ON p.id = rp.project_id WHERE rp.id=?",
+                      (repo_id,)).fetchone()
+    if not r or not (r["instructions"] or "").strip():
+        return ""
+    return (f"PROJECT-WIDE GROUND TRUTH — applies to every repo in project "
+            f"\"{r['name']}\"; treat as authoritative fact and obey it (do NOT report "
+            f"anything it declares handled/secure):\n{r['instructions'].strip()}")
+
+
 def triage_context(repo_id: int) -> str:
     """A prose block of the operator's prior triage decisions AND comments for a repo,
     injected into the next scan's context so the agent stays consistent — it stops
@@ -628,6 +783,172 @@ def triage_context(repo_id: int) -> str:
                          + (f" ({w})" if w else "") + f": {body}")
     parts.append("Apply the same reasoning to similar new findings before recording them.")
     return "\n".join(parts)
+
+
+# --- reviewer aid: "why this might be a false positive" ---------------------------
+# HINTS ONLY. These never change a finding's status — they hand the human reviewer a
+# head start by surfacing the project's accumulated shared knowledge (ground-truth
+# instructions, sibling service cards, prior triage, reviewer comments) that could
+# explain this finding away. The reviewer decides; this just tells them where to look.
+
+_HINT_STOP = {
+    "the", "and", "for", "with", "that", "this", "from", "have", "which", "when", "into",
+    "your", "their", "then", "than", "will", "would", "could", "should", "there", "where",
+    "does", "done", "only", "also", "some", "such", "been", "being", "were", "was", "are",
+    "not", "but", "can", "may", "via", "use", "used", "using", "http", "https", "request",
+    "requests", "response", "value", "values", "field", "fields", "data", "code", "line",
+    "file", "files", "function", "method", "methods", "call", "calls", "input", "name",
+    "endpoint", "endpoints", "route", "routes", "found", "issue", "finding", "allows",
+}
+# security-domain signals: an overlap on ANY of these is meaningful on its own.
+_AUTH_SIGNALS = {
+    "auth", "authentication", "authorization", "authorize", "authz", "authn", "jwt", "jwk",
+    "token", "tokens", "session", "cookie", "cookies", "oauth", "oidc", "okta", "saml",
+    "login", "logout", "credential", "credentials", "permission", "permissions", "role",
+    "roles", "rbac", "abac", "acl", "access", "idor", "ownership", "owner", "tenant",
+    "tenancy", "csrf", "cors", "gateway", "middleware", "guard", "identity", "principal",
+    "unauthenticated", "unauthorized", "privilege", "escalation",
+}
+
+
+# short security acronyms worth matching despite being under the length floor.
+_SHORT_SIGNALS = {"jwt", "jwk", "sql", "xss", "acl", "sso", "mfa", "otp", "xxe",
+                  "rce", "iam", "kms", "api"}
+
+
+def _hint_terms(*texts: str) -> set[str]:
+    out: set[str] = set()
+    for t in texts:
+        for tok in re.split(r"[^a-z0-9]+", (t or "").lower()):
+            if tok in _HINT_STOP:
+                continue
+            if len(tok) >= 4 or tok in _SHORT_SIGNALS:
+                out.add(tok)
+    return out
+
+
+def _hint_auth_related(terms: set[str], f: dict) -> bool:
+    cat = (f.get("category") or "").lower()
+    if any(k in cat for k in ("auth", "idor", "access", "privil", "tenant",
+                              "object-level", "function-level", "broken", "ssrf")):
+        return True
+    return bool(terms & _AUTH_SIGNALS)
+
+
+def review_hints(f: dict) -> list[dict]:
+    """Non-authoritative reasons THIS finding might be a false positive, drawn from the
+    project's accumulated shared knowledge. Returns [{source, reason}]. HINTS ONLY —
+    they never change status; the reviewer decides. Computed at read time so they always
+    reflect the latest project instructions, sibling cards, triage and comments."""
+    repo_id = f.get("repo_id")
+    if not repo_id:
+        return []
+    fterms = _hint_terms(f.get("title"), f.get("category"), f.get("description"),
+                         f.get("entrypoint"), f.get("cwe"))
+    auth_related = _hint_auth_related(fterms, f)
+    my_uuid = f.get("uuid") or ""
+    hints: list[dict] = []
+    with connect() as c:
+        prow = c.execute(
+            "SELECT p.id AS pid, p.name AS name, p.instructions AS instr "
+            "FROM repos rp JOIN projects p ON p.id=rp.project_id WHERE rp.id=?",
+            (repo_id,)).fetchone()
+        project = dict(prow) if prow else None
+
+        # 1) project ground-truth lines that overlap this finding.
+        if project and (project["instr"] or "").strip():
+            for raw in project["instr"].splitlines():
+                ln = raw.strip(" -*\t•")
+                if len(ln) < 6:
+                    continue
+                shared = fterms & _hint_terms(ln)
+                if (shared & _AUTH_SIGNALS) or len(shared) >= 2:
+                    hints.append({
+                        "source": f"Project ground truth ({project['name']})",
+                        "reason": f"The project declares as fact: “{ln}” — if this "
+                                  "finding is that same mechanism, it may already be handled."})
+                if len(hints) >= 2:
+                    break
+
+        # scope for prior triage / comments: the whole project if grouped, else this repo.
+        scope_ids = [repo_id]
+        if project:
+            sib = [r["id"] for r in c.execute(
+                "SELECT id FROM repos WHERE project_id=?", (project["pid"],))]
+            if sib:
+                scope_ids = sib
+        qmarks = ",".join("?" * len(scope_ids))
+
+        # 2) sibling service cards — auth enforced elsewhere, or the caller is authed.
+        if auth_related and project:
+            for s in c.execute(
+                    "SELECT sc.slug AS slug, sc.card_json AS cj FROM service_cards sc "
+                    "JOIN repos rp ON rp.id=sc.repo_id WHERE rp.project_id=? AND sc.repo_id!=?",
+                    (project["pid"], repo_id)).fetchall():
+                try:
+                    card = json.loads(s["cj"])
+                except (ValueError, TypeError):
+                    continue
+                enf = (card.get("authz") or {}).get("enforced_at")
+                if enf:
+                    hints.append({
+                        "source": f"Sibling service “{s['slug']}”",
+                        "reason": f"“{s['slug']}” enforces authorization at {enf}. If this "
+                                  "endpoint sits behind that shared boundary (e.g. a gateway), the "
+                                  "missing local check may be enforced upstream."})
+                ep = (f.get("entrypoint") or "").split()
+                ep_tail = ep[-1] if ep else ""
+                for call in (card.get("calls") or []):
+                    tgt = call.get("target") or ""
+                    if call.get("auth_sent") and tgt and ep_tail and ep_tail in tgt:
+                        hints.append({
+                            "source": f"Sibling service “{s['slug']}”",
+                            "reason": f"“{s['slug']}” calls {tgt} sending {call['auth_sent']} — "
+                                      "the caller is authenticated, so an ‘unauthenticated’ "
+                                      "reach here may be internal service-to-service traffic."})
+                if len(hints) >= 5:
+                    break
+
+        # 3) prior findings a human already DISMISSED that look similar.
+        for r in c.execute(
+                f"SELECT title, category, triage, triage_note FROM findings "
+                f"WHERE repo_id IN ({qmarks}) AND triage IN "
+                f"({','.join('?' * len(TRIAGE_DISMISSED))}) AND uuid!=?",
+                (*scope_ids, *TRIAGE_DISMISSED, my_uuid)).fetchall():
+            same_cat = bool(r["category"]) and \
+                (r["category"] or "").lower() == (f.get("category") or "").lower()
+            if same_cat or len(_hint_terms(r["title"]) & fterms) >= 2:
+                note = (r["triage_note"] or "").strip()
+                hints.append({
+                    "source": f"Prior triage — {TRIAGE_LABEL.get(r['triage'], r['triage'])}",
+                    "reason": f"A similar finding was dismissed: “{r['title']}”"
+                              + (f" — reviewer noted: “{note}”" if note else "")
+                              + ". Consider whether the same reasoning applies here."})
+            if len(hints) >= 7:
+                break
+
+        # 4) reviewer comments left on related findings.
+        for r in c.execute(
+                f"SELECT f.title AS title, fc.body AS body FROM finding_comments fc "
+                f"JOIN findings f ON f.uuid=fc.finding_uuid "
+                f"WHERE f.repo_id IN ({qmarks}) AND f.uuid!=?",
+                (*scope_ids, my_uuid)).fetchall():
+            body = (r["body"] or "").strip()
+            if body and len(_hint_terms(r["title"], body) & fterms) >= 2:
+                hints.append({
+                    "source": "Reviewer note on a related finding",
+                    "reason": f"On “{r['title']}” a reviewer wrote: “{body}”"})
+            if len(hints) >= 9:
+                break
+
+    seen: set[str] = set()
+    uniq: list[dict] = []
+    for h in hints:
+        if h["reason"] in seen:
+            continue
+        seen.add(h["reason"])
+        uniq.append(h)
+    return uniq[:6]
 
 
 def counts() -> dict:

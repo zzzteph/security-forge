@@ -18,6 +18,7 @@ createApp({
       repos: [], runner: { running: null, queued: 0 },
       backends: [], backendsHome: '/data/home', authModal: null,
       skills: [], skillForm: null, skillErr: '',
+      projects: [], projectForm: null, projectErr: '', repoSearch: '',
       settings: { defaults: { backend: 'litellm', model: '', base_url: '', max_turns: '',
         temperature: '', timeout: '', agent_cmd: '', agent_output: '', extra_args: '', env: [] },
         max_concurrent_scans: 1 },
@@ -26,7 +27,8 @@ createApp({
       current: null,          // repo detail
       finding: null,          // finding detail (advisory)
       scans: [], scanView: null,
-      sort: {},               // { tableName: { key, dir } } — click-to-sort per table
+      // default sort so new rows land predictably (not "randomly"): repos A→Z, findings by severity
+      sort: { repos: { key: 'slug', dir: 1 }, findings: { key: 'severity', dir: -1 } },
       poll: null, clock: null, nowTs: Date.now(),
       menuOpen: false,        // mobile nav drawer
       toast: null,            // transient notification
@@ -38,6 +40,11 @@ createApp({
     filteredFindings() {
       return this.findings.filter(f =>
         (!this.findingFilter.status || f.status === this.findingFilter.status));
+    },
+    reposFiltered() {
+      const q = (this.repoSearch || '').trim().toLowerCase();
+      if (!q) return this.repos;
+      return this.repos.filter(r => ((r.slug || '') + ' ' + (r.name || '')).toLowerCase().includes(q));
     },
     activeScans() { return (this.scans || []).filter(s => ['queued', 'running'].includes(s.status)); },
     recentScans() { return (this.scans || []).slice(0, 6); },
@@ -82,6 +89,7 @@ createApp({
       if (view === 'findings') this.loadFindings();
       if (view === 'scans') this.loadScans();
       if (view === 'skills') this.loadSkills();
+      if (view === 'projects') this.loadProjects();
       if (view === 'backends') this.loadBackends();
       if (view === 'settings') { this.loadSettings(); this.loadBackends(); }
       if (!skipHash) this.pushHash('#/' + view);
@@ -95,7 +103,7 @@ createApp({
       const i = raw.indexOf('/');
       const seg = i < 0 ? raw : raw.slice(0, i);
       const id = i < 0 ? '' : raw.slice(i + 1);
-      const views = ['dashboard', 'repos', 'findings', 'scans', 'skills', 'backends', 'settings'];
+      const views = ['dashboard', 'repos', 'findings', 'scans', 'projects', 'skills', 'backends', 'settings'];
       if (!seg || views.includes(seg)) return this.go(seg || 'dashboard', true);
       if (seg === 'finding' && id) { this.current = null; this.scanView = null; this.view = 'finding'; return this.openFinding({ uuid: id }, true); }
       if (seg === 'repo' && id) return this.openRepo({ id: +id }, true);
@@ -110,6 +118,25 @@ createApp({
     },
     async loadRepos() {
       const d = await this.api('GET', '/api/repos'); this.repos = d.repos; this.runner = d.runner;
+      try { this.projects = (await this.api('GET', '/api/projects')).projects; } catch (e) {}
+    },
+    projectName(id) { const p = (this.projects || []).find(x => x.id === id); return p ? p.name : ''; },
+    // Projects — a group of repos sharing inherited ground-truth instructions
+    async loadProjects() { this.projects = (await this.api('GET', '/api/projects')).projects; },
+    newProject() { this.projectErr = ''; this.projectForm = { name: '', instructions: '' }; },
+    async editProject(p) { this.projectErr = ''; this.projectForm = await this.api('GET', '/api/projects/' + p.id); },
+    async saveProject() {
+      this.projectErr = '';
+      if (!(this.projectForm.name || '').trim()) { this.projectErr = 'Name required'; return; }
+      try {
+        if (this.projectForm.id) await this.api('PUT', '/api/projects/' + this.projectForm.id, this.projectForm);
+        else await this.api('POST', '/api/projects', this.projectForm);
+        this.projectForm = null; await this.loadProjects();
+      } catch (e) { this.projectErr = String(e.message || e); }
+    },
+    async deleteProject(p) {
+      if (!confirm('Delete project "' + p.name + '"? Its repos are kept (just un-grouped).')) return;
+      await this.api('DELETE', '/api/projects/' + p.id); await this.loadProjects();
     },
     async loadFindings() {
       const q = new URLSearchParams();
@@ -212,12 +239,14 @@ createApp({
     // model, keys, args) is one global template in Settings, applied to every scan.
     newRepo() {
       this.editing = 'new'; this.formErr = '';
-      this.repoForm = { url: '', name: '', cron: '', context: '', enabled: true, _nameTouched: false };
+      this.repoForm = { url: '', name: '', cron: '', context: '', enabled: true,
+        project_id: null, _nameTouched: false };
     },
     editRepo(r) {
       this.editing = r.id; this.formErr = '';
       this.repoForm = { id: r.id, url: r.url, name: r.name || '', cron: r.cron || '',
-        context: r.context || '', enabled: !!r.enabled, _nameTouched: true };
+        context: r.context || '', enabled: !!r.enabled,
+        project_id: r.project_id != null ? r.project_id : null, _nameTouched: true };
     },
     deriveName(url) {
       const s = (url || '').trim().replace(/\/+$/, '').replace(/\.git$/i, '');
@@ -279,6 +308,7 @@ createApp({
       this.finding = d.finding;
       this.finding._md = d.advisory_markdown;
       this.finding._comments = d.comments || [];
+      this.finding._hints = d.review_hints || [];
       this.finding._triageValues = d.triage_values || Object.keys(TRIAGE_LABELS);
       this.finding._triageLabels = d.triage_labels || TRIAGE_LABELS;
       this.commentDraft = ''; this.triageMsg = '';
@@ -298,6 +328,7 @@ createApp({
     },
     triageLabel(t) { return TRIAGE_LABELS[t] || t; },
     triageShort(t) { return TRIAGE_SHORT[t] || t; },
+    rowTri(f) { return f && f.triage && f.triage !== 'unset' ? 'row-' + f.triage : ''; },
     triageFiltered(list) {
       const t = this.findingFilter.triage;
       if (!t) return list;
@@ -449,6 +480,7 @@ createApp({
       <a :class="{on:view=='repos'||view=='repo'}" @click="go('repos')">Repositories</a>
       <a :class="{on:view=='findings'||view=='finding'}" @click="go('findings')">Findings</a>
       <a :class="{on:view=='scans'}" @click="go('scans')">Scans</a>
+      <a :class="{on:view=='projects'}" @click="go('projects')">Projects</a>
       <a :class="{on:view=='skills'}" @click="go('skills')">Skills</a>
       <a :class="{on:view=='backends'}" @click="go('backends')">Backends</a>
       <a :class="{on:view=='settings'}" @click="go('settings')">Settings</a>
@@ -502,7 +534,7 @@ createApp({
           <th @click="toggleSort('dash','slug')" style="cursor:pointer">Project{{caret('dash','slug')}}</th>
           <th @click="toggleSort('dash','title')" style="cursor:pointer">Title{{caret('dash','title')}}</th>
           <th @click="toggleSort('dash','file')" style="cursor:pointer">Where{{caret('dash','file')}}</th></tr></thead>
-        <tbody><tr v-for="f in sortRows(dashFindings,'dash').slice(0,25)" :key="f.id" @click="openFinding(f); view='finding'" style="cursor:pointer">
+        <tbody><tr v-for="f in sortRows(dashFindings,'dash').slice(0,25)" :key="f.id" :class="rowTri(f)" @click="openFinding(f); view='finding'" style="cursor:pointer">
           <td><span class="badge" :class="'b-'+f.severity">{{f.severity}}</span></td>
           <td class="muted">{{f.slug}}</td>
           <td>{{f.title}}<span v-if="f.triage && f.triage!=='unset'" class="tri" :class="'tri-'+f.triage">{{triageShort(f.triage)}}</span></td>
@@ -513,7 +545,10 @@ createApp({
 
     <!-- REPOS -->
     <div v-if="view=='repos'">
-      <div class="flex" style="margin-bottom:10px"><span class="muted" style="font-size:12px">All scans use the global AI configuration (<a @click="go('settings')">Settings</a>).</span><span class="spacer"></span><button class="primary" @click="newRepo">+ Add repository</button></div>
+      <div class="flex" style="margin-bottom:10px">
+        <input v-model="repoSearch" placeholder="Search repositories…" style="max-width:300px">
+        <span class="muted" style="font-size:12px">All scans use the global AI configuration (<a @click="go('settings')">Settings</a>).</span>
+        <span class="spacer"></span><button class="primary" @click="newRepo">+ Add repository</button></div>
       <div class="card"><table>
         <thead><tr>
           <th @click="toggleSort('repos','slug')" style="cursor:pointer">Repository{{caret('repos','slug')}}</th>
@@ -522,9 +557,11 @@ createApp({
           <th @click="toggleSort('repos','open_findings')" style="cursor:pointer">Open{{caret('repos','open_findings')}}</th>
           <th @click="toggleSort('repos','last_status')" style="cursor:pointer">Last{{caret('repos','last_status')}}</th><th></th></tr></thead>
         <tbody>
-          <tr v-for="r in pageSlice(sortRows(repos,'repos'),'repos')" :key="r.id">
-            <td><a @click="openRepo(r)">{{r.slug}}</a><div class="muted" v-if="!r.enabled">disabled</div></td>
-            <td class="mono muted">{{r.cron||'—'}}</td>
+          <tr v-for="r in pageSlice(sortRows(reposFiltered,'repos'),'repos')" :key="r.id">
+            <td><a @click="openRepo(r)">{{r.slug}}</a>
+              <span class="muted" v-if="!r.enabled"> · disabled</span>
+              <div class="muted" style="font-size:11px" v-if="projectName(r.project_id)">▤ {{projectName(r.project_id)}}</div></td>
+            <td class="mono muted">{{r.cron||'manual'}}</td>
             <td class="muted nowrap">{{fmt(r.next_run)||'—'}}</td>
             <td><b>{{r.open_findings}}</b> <span class="muted" style="font-size:11px">{{sevList(r.by_severity)}}</span></td>
             <td><span class="pill" :class="r.last_status">{{r.last_status||'never'}}</span></td>
@@ -533,15 +570,15 @@ createApp({
               <button class="sm" @click="editRepo(r)">Edit</button>
               <button class="sm danger" @click="deleteRepo(r)">✕</button></td>
           </tr>
-          <tr v-if="!repos.length"><td colspan="6" class="muted">No repositories yet. Add one to start continuous scanning.</td></tr>
+          <tr v-if="!reposFiltered.length"><td colspan="6" class="muted">{{repos.length ? 'No repositories match your search.' : 'No repositories yet. Add one to start continuous scanning.'}}</td></tr>
         </tbody></table>
-        <div class="pager" v-if="repos.length">
+        <div class="pager" v-if="reposFiltered.length">
           <span class="muted">Rows</span>
           <select style="width:auto" v-model="pageState.repos.size" @change="pageState.repos.page=1"><option v-for="n in pageSizes" :key="n" :value="n">{{n}}</option></select>
           <span class="spacer"></span>
-          <span class="muted nowrap">{{pageMeta(repos.length,'repos').from}}–{{pageMeta(repos.length,'repos').to}} of {{repos.length}}</span>
-          <button class="sm" :disabled="pageMeta(repos.length,'repos').page<=1" @click="pageGo('repos',-1)">‹ Prev</button>
-          <button class="sm" :disabled="pageMeta(repos.length,'repos').page>=pageMeta(repos.length,'repos').pages" @click="pageGo('repos',1)">Next ›</button>
+          <span class="muted nowrap">{{pageMeta(reposFiltered.length,'repos').from}}–{{pageMeta(reposFiltered.length,'repos').to}} of {{reposFiltered.length}}</span>
+          <button class="sm" :disabled="pageMeta(reposFiltered.length,'repos').page<=1" @click="pageGo('repos',-1)">‹ Prev</button>
+          <button class="sm" :disabled="pageMeta(reposFiltered.length,'repos').page>=pageMeta(reposFiltered.length,'repos').pages" @click="pageGo('repos',1)">Next ›</button>
         </div>
       </div>
     </div>
@@ -563,7 +600,7 @@ createApp({
           <th @click="toggleSort('rfind','title')" style="cursor:pointer">Title{{caret('rfind','title')}}</th>
           <th @click="toggleSort('rfind','file')" style="cursor:pointer">Where{{caret('rfind','file')}}</th>
           <th @click="toggleSort('rfind','status')" style="cursor:pointer">Status{{caret('rfind','status')}}</th></tr></thead>
-        <tbody><tr v-for="f in sortRows(current.findings,'rfind')" :key="f.id" style="cursor:pointer" @click="openFinding(f); view='finding'">
+        <tbody><tr v-for="f in sortRows(current.findings,'rfind')" :key="f.id" :class="rowTri(f)" style="cursor:pointer" @click="openFinding(f); view='finding'">
           <td><span class="badge" :class="'b-'+f.severity">{{f.severity}}</span></td>
           <td>{{f.title}}</td><td class="mono muted where">{{f.file}}{{f.line?':'+f.line:''}}</td>
           <td><span class="pill" :class="f.status">{{f.status}}</span></td></tr>
@@ -608,7 +645,7 @@ createApp({
           <th @click="toggleSort('findings','file')" style="cursor:pointer">Where{{caret('findings','file')}}</th>
           <th @click="toggleSort('findings','status')" style="cursor:pointer">Status{{caret('findings','status')}}</th>
           <th @click="toggleSort('findings','last_seen')" style="cursor:pointer">Seen{{caret('findings','last_seen')}}</th></tr></thead>
-        <tbody><tr v-for="f in pageSlice(sortRows(triageFiltered(findings),'findings'),'findings')" :key="f.id" style="cursor:pointer" @click="openFinding(f); view='finding'">
+        <tbody><tr v-for="f in pageSlice(sortRows(triageFiltered(findings),'findings'),'findings')" :key="f.id" :class="rowTri(f)" style="cursor:pointer" @click="openFinding(f); view='finding'">
           <td><span class="badge" :class="'b-'+f.severity">{{f.severity}}</span></td>
           <td class="muted">{{f.slug}}</td><td>{{f.title}}</td>
           <td class="mono muted where">{{f.file}}{{f.line?':'+f.line:''}}</td>
@@ -633,6 +670,17 @@ createApp({
         <span class="pill" :class="finding.status">{{finding.status}}</span>
         <span v-if="finding.triage && finding.triage!=='unset'" class="tri" :class="'tri-'+finding.triage">{{triageShort(finding.triage)}}</span>
         <button class="sm primary" @click="pdf('/api/findings/'+encodeURIComponent(finding.uuid||finding.id)+'/advisory.pdf')">Download PDF</button></div>
+
+      <!-- REVIEW HINTS: reasons this MIGHT be a false positive (from shared knowledge) -->
+      <div class="card" v-if="finding._hints && finding._hints.length"
+           style="border-left:4px solid #d9a406;background:#fffbeb">
+        <h2 style="margin-top:0">💡 Possible false-positive reasons <span class="muted" style="font-weight:400;font-size:13px">— for the reviewer, not a verdict</span></h2>
+        <div class="muted" style="font-size:13px;margin-bottom:10px">Drawn from this project's shared knowledge (ground-truth instructions, sibling service cards, prior triage, reviewer comments). Consider each before confirming — the decision is still yours.</div>
+        <div v-for="(h,i) in finding._hints" :key="i" style="margin-bottom:10px">
+          <div class="muted" style="font-size:11px;text-transform:uppercase;letter-spacing:.04em">{{h.source}}</div>
+          <div style="white-space:pre-wrap">{{h.reason}}</div>
+        </div>
+      </div>
 
       <!-- TRIAGE -->
       <div class="card">
@@ -694,6 +742,26 @@ createApp({
           <button class="sm" :disabled="pageMeta(scans.length,'scans').page>=pageMeta(scans.length,'scans').pages" @click="pageGo('scans',1)">Next ›</button>
         </div>
       </div>
+    </div>
+
+    <!-- PROJECTS -->
+    <div v-if="view=='projects'">
+      <div class="flex" style="margin-bottom:10px"><span class="muted" style="font-size:12px">A project groups related repos and shares one set of ground-truth instructions with all of them (e.g. "JWT is validated via JWK", "OKTA handles auth"). Wire repos to a project in the repo's Edit dialog.</span><span class="spacer"></span><button class="primary" @click="newProject">+ Add project</button></div>
+      <div class="card"><table>
+        <thead><tr>
+          <th @click="toggleSort('projects','name')" style="cursor:pointer">Project{{caret('projects','name')}}</th>
+          <th @click="toggleSort('projects','repo_count')" style="cursor:pointer">Repos{{caret('projects','repo_count')}}</th>
+          <th>Instructions</th>
+          <th @click="toggleSort('projects','updated')" style="cursor:pointer">Updated{{caret('projects','updated')}}</th><th></th></tr></thead>
+        <tbody>
+          <tr v-for="p in sortRows(projects,'projects')" :key="p.id">
+            <td><a @click="editProject(p)">{{p.name}}</a></td>
+            <td>{{p.repo_count}}</td>
+            <td class="muted" style="max-width:420px">{{(p.instructions||'').slice(0,140)}}{{(p.instructions||'').length>140?'…':''}}</td>
+            <td class="muted nowrap">{{fmt(p.updated)}}</td>
+            <td class="nowrap right"><button class="sm" @click="editProject(p)">Edit</button><button class="sm danger" @click="deleteProject(p)">✕</button></td></tr>
+          <tr v-if="!projects.length"><td colspan="5" class="muted">No projects yet. Create one to share instructions across a set of repos.</td></tr>
+        </tbody></table></div>
     </div>
 
     <!-- SKILLS -->
@@ -799,6 +867,10 @@ createApp({
   <div class="row"><div><label>Name</label><input v-model="repoForm.name" @input="repoForm._nameTouched=true" placeholder="auto from URL"></div>
     <div><label>Schedule (cron, UTC)</label><input class="mono" v-model="repoForm.cron" placeholder="0 3 * * *"></div></div>
   <div class="muted" style="font-size:12px;margin-top:4px">{{cronText(repoForm.cron)}}</div>
+  <label>Project (optional) — inherits the project's shared instructions</label>
+  <select v-model="repoForm.project_id">
+    <option :value="null">— none —</option>
+    <option v-for="p in projects" :key="p.id" :value="p.id">{{p.name}}</option></select>
   <label>Context — focus areas, what is NOT an issue, triage hints</label>
   <textarea v-model="repoForm.context" placeholder="Focus on auth/IDOR and file upload. The /health endpoint is public by design (not an issue). Ignore test fixtures."></textarea>
   <label class="flex" style="margin-top:10px"><input type="checkbox" style="width:auto" v-model="repoForm.enabled"> <span>Enabled (scheduled scanning)</span></label>
@@ -807,6 +879,21 @@ createApp({
   <div class="right flex" style="margin-top:14px;justify-content:flex-end">
     <button @click="editing=null;repoForm=null">Cancel</button>
     <button class="primary" @click="saveRepo">Save</button></div>
+</div></div>
+
+<!-- PROJECT EDIT MODAL -->
+<div v-if="projectForm" class="modal-bg"><div class="modal" style="width:min(720px,95vw)">
+  <h2 style="margin-top:0">{{projectForm.id?'Edit project':'Add project'}}</h2>
+  <label>Name</label><input v-model="projectForm.name" placeholder="e.g. Acme Platform">
+  <label>Shared instructions — ground truth for every repo in this project</label>
+  <textarea v-model="projectForm.instructions" style="min-height:220px"
+    placeholder="1. JWT signatures ARE validated against the JWK endpoint (shared auth lib) — do NOT flag missing JWT verification.&#10;2. Authentication is delegated to OKTA; OKTA-protected routes are authenticated.&#10;3. Tenant scoping is enforced by the base repository layer."></textarea>
+  <div class="muted" style="font-size:12px;margin-top:6px" v-if="projectForm.repos && projectForm.repos.length">Repos in this project: {{projectForm.repos.map(r=>r.slug).join(', ')}}</div>
+  <div class="muted" style="font-size:12px;margin-top:6px">Assign repos to this project from each repo's <b>Edit</b> dialog.</div>
+  <div class="err" v-if="projectErr">{{projectErr}}</div>
+  <div class="right flex" style="margin-top:14px;justify-content:flex-end">
+    <button @click="projectForm=null">Cancel</button>
+    <button class="primary" @click="saveProject">Save</button></div>
 </div></div>
 
 <!-- SKILL EDIT MODAL -->
@@ -838,7 +925,7 @@ createApp({
   <div v-if="scanView.findings && scanView.findings.length">
     <h2 style="margin:14px 0 6px">Findings in this scan ({{scanView.findings.length}})</h2>
     <table><thead><tr><th>Sev</th><th>Title</th><th>Where</th><th>Status</th></tr></thead>
-      <tbody><tr v-for="f in scanView.findings" :key="f.uuid||f.id" style="cursor:pointer" @click="openFindingFromScan(f)">
+      <tbody><tr v-for="f in scanView.findings" :key="f.uuid||f.id" :class="rowTri(f)" style="cursor:pointer" @click="openFindingFromScan(f)">
         <td><span class="badge" :class="'b-'+f.severity">{{f.severity}}</span></td>
         <td>{{f.title}}</td><td class="mono muted where">{{f.file}}{{f.line?':'+f.line:''}}</td>
         <td><span class="stwrap"><span class="pill" :class="f.status">{{f.status}}</span>

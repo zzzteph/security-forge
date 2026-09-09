@@ -212,9 +212,12 @@ so parallel agents never race on it. Minimum schema:
   "roles": [{"name": "", "represented_by": "", "can": [], "file": ""}],
   "auth": {"authn": {"mechanism": "", "established_at": "", "identity_read": ""},
            "authz": {"model": "", "enforced_at": [], "gaps": [], "object_level": ""}},
+  "calls": [{"target": "other-service/route", "kind": "http|grpc|bus", "where": "file:line", "auth_sent": ""}],
   "trust_boundaries": [], "coverage": {"areas": [], "unmapped": []}
 }
 ```
+`calls` = OUTBOUND service dependencies (what this service calls in OTHER services) —
+capture HTTP/gRPC/bus targets so a project can cross-check "route in A calls B".
 `entrypoints[].id` and `.files` are what incremental runs use to map a changed
 file back to an entry point.
 

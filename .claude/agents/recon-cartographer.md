@@ -84,11 +84,23 @@ scope's slice**:
     "authn": {"mechanism": "jwt", "established_at": "src/auth/mw.py:15", "identity_read": "req.user", "notes": "..."},
     "authz": {"model": "rbac+ownership", "enforced_at": ["src/auth/mw.py:30"], "gaps": ["/internal/* has no guard: src/api/internal.py:8"], "object_level": "sometimes missing (see IDOR notes)"}
   },
+  "calls": [
+    {"target": "payments/charge", "kind": "http", "where": "src/orders/pay.py:60", "auth_sent": "service JWT"},
+    {"target": "inventory.reserve", "kind": "grpc", "where": "src/orders/stock.py:22"}
+  ],
   "trust_boundaries": ["browser->app", "app->stripe", "app->db"],
   "coverage": {"routers_read": ["src/api/__init__.py"], "areas": ["api", "auth", "models"], "unmapped": ["worker/ not yet read"]},
   "notes": "anything the orchestrator or later phases should know"
 }
 ```
+**`calls` — OUTBOUND service dependencies (important for microservices).** List every
+place this service calls ANOTHER service/API: HTTP clients (`HttpClient`, `fetch`,
+`requests`), typed/gRPC clients, message-bus publishes, and service-SDK calls.
+`target` is the logical service + route/method it hits (e.g. `payments/charge`,
+`inventory.Reserve`), `kind` is http/grpc/bus, `where` is `file:line`, and
+`auth_sent` (optional) is what credential it forwards. This is what lets a project
+cross-check "route in service A calls service B" — capture it whenever you can, even
+if partial.
 `entrypoints[].id` must be stable (method + normalized route, or
 `kind:handler_file:symbol`) so incremental runs can diff the surface and map
 changed files back to entry points. Be honest in `coverage.unmapped` — say what

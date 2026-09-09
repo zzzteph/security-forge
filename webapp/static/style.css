@@ -70,6 +70,16 @@ tr:hover td{background:var(--panel2)}
 .tri-accepted_risk,.tri-wont_fix{color:var(--med);border-color:var(--med)}
 .tri-duplicate{color:var(--muted)}
 
+/* triaged rows: tint the whole row so disposition reads at a glance in the table */
+tr.row-confirmed td{background:rgba(255,90,95,.09)}
+tr.row-false_positive td{background:rgba(46,160,67,.10)}
+tr.row-accepted_risk td,tr.row-wont_fix td{background:rgba(210,153,34,.10)}
+tr.row-duplicate td{background:rgba(140,140,150,.10)}
+tr.row-confirmed:hover td{background:rgba(255,90,95,.16)}
+tr.row-false_positive:hover td{background:rgba(46,160,67,.17)}
+tr.row-accepted_risk:hover td,tr.row-wont_fix:hover td{background:rgba(210,153,34,.17)}
+tr.row-duplicate:hover td{background:rgba(140,140,150,.17)}
+
 /* comment thread */
 .comment{border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-bottom:8px;background:var(--panel2)}
 
