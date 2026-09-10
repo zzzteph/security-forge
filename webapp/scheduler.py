@@ -18,7 +18,10 @@ _sched = BackgroundScheduler(timezone="UTC")
 def _fire(repo_id: int) -> None:
     repo = db.get_repo(repo_id)
     if repo and repo.get("enabled"):
-        runner.enqueue(repo_id, trigger="schedule")
+        try:
+            runner.enqueue(repo_id, trigger="schedule")
+        except runner.AlreadyQueued:
+            pass   # previous run still going — skip this tick rather than pile up
 
 
 def reload() -> dict:

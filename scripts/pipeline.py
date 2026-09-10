@@ -357,6 +357,231 @@ def _knowledge_doc(slug: str, name: str, cap: int = 12000) -> str:
         return ""
 
 
+def _load_model(slug: str) -> dict:
+    """The machine-readable recon model (model.json) for this repo, or {}."""
+    try:
+        p = KNOWLEDGE_ROOT / slug / "model.json"
+        return json.loads(p.read_text(encoding="utf-8", errors="replace")) if p.is_file() else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _md_cell(v) -> str:
+    """Flatten a scalar/list/dict into one safe single-line Markdown table cell."""
+    if v is None or v == "":
+        return "—"
+    if isinstance(v, bool):
+        return "yes" if v else "no"
+    if isinstance(v, (list, tuple)):
+        return ", ".join(_md_cell(x) for x in v if x not in (None, "")) or "—"
+    if isinstance(v, dict):
+        return "; ".join(f"{k}={_md_cell(x)}" for k, x in v.items() if x not in (None, "")) or "—"
+    return str(v).replace("|", "\\|").replace("\n", " ").strip() or "—"
+
+
+# --- shared builders: render one section from model.json, defensive across the
+# schema variants (auth{authn,authz} vs security_controls{} vs a flat authz_model;
+# entrypoints keyed by id/route/ctrl/handler). Each returns [] when there's nothing.
+
+def _auth_lines(model: dict) -> list[str]:
+    auth = model.get("auth") if isinstance(model.get("auth"), dict) else {}
+    sc = model.get("security_controls") if isinstance(model.get("security_controls"), dict) else {}
+    authn = auth.get("authn") or sc.get("authn")
+    authz = auth.get("authz") or sc.get("authz") or model.get("authz_model")
+    out: list[str] = []
+    if authn:
+        if isinstance(authn, dict):
+            extra = "; ".join(f"{k}: {authn[k]}" for k in ("established_at", "identity_read", "notes")
+                              if authn.get(k))
+            out.append(f"- **Authentication:** {authn.get('mechanism') or '?'}"
+                       + (f" ({extra})" if extra else ""))
+        else:
+            out.append(f"- **Authentication:** {authn}")
+    if authz:
+        if isinstance(authz, dict):
+            out.append(f"- **Authorization:** {authz.get('model') or '?'}"
+                       + (f" — enforced at: {_md_cell(authz.get('enforced_at'))}"
+                          if authz.get("enforced_at") else "")
+                       + (f"; object-level: {authz.get('object_level')}"
+                          if authz.get("object_level") else ""))
+            if authz.get("gaps"):
+                out.append("- **Known gaps:**")
+                out.extend(f"  - {g}" for g in authz["gaps"])
+        else:
+            out.append(f"- **Authorization:** {authz}")
+    if sc.get("input_validation"):
+        out.append(f"- **Input validation:** {sc['input_validation']}")
+    return out
+
+
+def _roles_table_lines(model: dict) -> list[str]:
+    roles = model.get("roles") or []
+    if not (isinstance(roles, list) and roles):
+        return []
+    out = ["| Role | Represented by | Can | Source |", "|---|---|---|---|"]
+    for r in roles:
+        r = r if isinstance(r, dict) else {"name": r}
+        out.append(f"| {_md_cell(r.get('name'))} "
+                   f"| {_md_cell(r.get('represented_by') or r.get('notes'))} "
+                   f"| {_md_cell(r.get('can'))} | {_md_cell(r.get('file'))} |")
+    return out
+
+
+def _entrypoints_table_lines(model: dict) -> list[str]:
+    eps = model.get("entrypoints") or []
+    if not (isinstance(eps, list) and eps):
+        return []
+    out = ["| Method | Route | Auth | Roles | Handler / lookup |", "|---|---|---|---|---|"]
+    for e in eps:
+        e = e if isinstance(e, dict) else {"id": e}
+        handler = (e.get("object_lookup") or e.get("handler") or e.get("ctrl")
+                   or e.get("handler_symbol") or e.get("sink")
+                   or e.get("handler_file") or e.get("file"))
+        ar = e.get("auth_required")
+        out.append(f"| {_md_cell(e.get('method') or e.get('kind'))} "
+                   f"| {_md_cell(e.get('route') or e.get('id'))} "
+                   f"| {(_md_cell(ar) if ar is not None else '—')} "
+                   f"| {_md_cell(e.get('roles'))} | {_md_cell(handler)} |")
+    return out
+
+
+def _model_auth_md(model: dict) -> list[str]:
+    """Inline Authorization map for the executive report when no AUTH/ROLES/ENTRYPOINTS
+    docs exist on disk. Returns [] if the model carries nothing usable."""
+    if not model:
+        return []
+    out: list[str] = []
+    aa = _auth_lines(model)
+    if aa:
+        out += ["### Authentication & authorization", "", *aa, ""]
+    rt = _roles_table_lines(model)
+    if rt:
+        out += ["### Roles / principals", "", *rt, ""]
+    et = _entrypoints_table_lines(model)
+    if et:
+        out += ["### Entry points", "", *et, ""]
+    if out:
+        out = ["_Rendered from the machine-readable recon model (`model.json`); no "
+               "human-authored AUTH/ROLES/ENTRYPOINTS docs were captured for this repo._",
+               "", *out]
+    return out
+
+
+# --- derive the durable per-repo knowledge docs from model.json ---------------
+# The recon-cartographer subagent writes these as prose (with file:line evidence) on
+# the claude-code backend; the litellm backend has no Agent tool so that subagent
+# never runs and only model.json survives. We regenerate ANY missing doc from the
+# model so every backend ends a cycle with a shareable PROJECT/AUTH/ROLES/ENTRYPOINTS/
+# TRUST_BOUNDARIES.md. An existing non-empty file (agent- or human-written) is left
+# untouched — the model is the fallback, not the authority.
+
+_DERIVED_NOTE = ("_Derived from `model.json` (the machine-readable recon model). "
+                 "Regenerated whenever this file is absent; an agent- or human-written "
+                 "version takes precedence and is never overwritten._")
+
+
+def _doc_project(model: dict) -> str:
+    idea = (model.get("idea") or model.get("summary") or "").strip()
+    stack = model.get("stack") if isinstance(model.get("stack"), dict) else {}
+    body: list[str] = [f"# Project — {model.get('target') or model.get('slug') or ''}".rstrip(),
+                       "", _DERIVED_NOTE, ""]
+    if idea:
+        body += ["## Purpose", "", idea, ""]
+    tech = []
+    if stack:
+        for label, key in [("Languages", "languages"), ("Frameworks", "frameworks"),
+                           ("Datastores", "datastores"), ("Boots with", "boots_with"),
+                           ("Ports", "ports")]:
+            if stack.get(key):
+                tech.append(f"- **{label}:** {_md_cell(stack.get(key))}")
+    else:  # flatter schemas (e.g. language/runtime at top level)
+        for label, key in [("Language", "language"), ("Runtime", "runtime")]:
+            if model.get(key):
+                tech.append(f"- **{label}:** {_md_cell(model.get(key))}")
+    if tech:
+        body += ["## Tech stack", "", *tech, ""]
+    if model.get("crown_jewels"):
+        body += ["## Crown jewels", "",
+                 *[f"- {_md_cell(x)}" for x in model["crown_jewels"]], ""]
+    notes = model.get("notes_for_humans") or model.get("notes")
+    if notes:
+        notes = notes if isinstance(notes, list) else [notes]
+        body += ["## Notes", "", *[f"- {_md_cell(n)}" for n in notes], ""]
+    return "\n".join(body).strip() + "\n" if (idea or tech or model.get("crown_jewels")) else ""
+
+
+def _doc_auth(model: dict) -> str:
+    lines = _auth_lines(model)
+    if not lines:
+        return ""
+    return "\n".join(["# Authentication & authorization", "", _DERIVED_NOTE, "", *lines]) + "\n"
+
+
+def _doc_roles(model: dict) -> str:
+    lines = _roles_table_lines(model)
+    if not lines:
+        return ""
+    return "\n".join(["# Roles / principals", "", _DERIVED_NOTE, "", *lines]) + "\n"
+
+
+def _doc_entrypoints(model: dict) -> str:
+    lines = _entrypoints_table_lines(model)
+    if not lines:
+        return ""
+    return "\n".join(["# Entry points (attack surface)", "", _DERIVED_NOTE, "", *lines]) + "\n"
+
+
+def _doc_trust_boundaries(model: dict) -> str:
+    tb = model.get("trust_boundaries") or []
+    raw_calls = (model.get("calls") or model.get("dependencies")
+                 or model.get("outbound_calls") or model.get("outbound") or [])
+    body: list[str] = ["# Trust boundaries", "", _DERIVED_NOTE, ""]
+    if tb:
+        body += ["## Trust zones", "", *[f"- {_md_cell(x)}" for x in tb], ""]
+    if isinstance(raw_calls, list) and raw_calls:
+        body += ["## Outbound calls (service dependencies)", "",
+                 "| Target | Kind | Where | Auth sent |", "|---|---|---|---|"]
+        for c in raw_calls:
+            c = c if isinstance(c, dict) else {"target": c}
+            body.append(f"| {_md_cell(c.get('target'))} | {_md_cell(c.get('kind'))} "
+                        f"| {_md_cell(c.get('where'))} | {_md_cell(c.get('auth_sent'))} |")
+        body.append("")
+    return "\n".join(body).strip() + "\n" if (tb or (isinstance(raw_calls, list) and raw_calls)) else ""
+
+
+_KNOWLEDGE_DOCS = [("PROJECT.md", _doc_project), ("ENTRYPOINTS.md", _doc_entrypoints),
+                   ("ROLES.md", _doc_roles), ("AUTH.md", _doc_auth),
+                   ("TRUST_BOUNDARIES.md", _doc_trust_boundaries)]
+
+
+def _ensure_knowledge_docs(slug: str) -> list[str]:
+    """Write any missing PROJECT/AUTH/ROLES/ENTRYPOINTS/TRUST_BOUNDARIES.md for this
+    repo from model.json. Skips docs that already exist non-empty (agent/human wrote
+    them) and docs the model can't populate. Returns the list of files it wrote."""
+    model = _load_model(slug)
+    if not model:
+        return []
+    kdir = KNOWLEDGE_ROOT / slug
+    written: list[str] = []
+    for name, render in _KNOWLEDGE_DOCS:
+        p = kdir / name
+        try:
+            if p.is_file() and p.read_text(encoding="utf-8", errors="replace").strip():
+                continue   # preserve an agent- or human-written doc
+        except OSError:
+            pass
+        body = render(model)
+        if not body.strip():
+            continue
+        try:
+            kdir.mkdir(parents=True, exist_ok=True)
+            p.write_text(body, encoding="utf-8")
+            written.append(name)
+        except OSError:
+            pass
+    return written
+
+
 def _advisory_body(f: dict) -> list[str]:
     """Meta line + explained sections for one finding (no heading). Shared by the
     standalone advisory file and any inline rendering."""
@@ -490,7 +715,11 @@ def _render_repo_report(slug: str, findings: list[dict], adv_links: dict | None 
     if eps:
         body.extend(["### Entry points", "", eps, ""])
     if not (auth or roles or eps):
-        body.extend(["_No durable auth model (AUTH/ROLES/ENTRYPOINTS) was captured for this repo._", ""])
+        model_md = _model_auth_md(_load_model(slug))
+        if model_md:
+            body.extend(model_md)
+        else:
+            body.extend(["_No durable auth model (AUTH/ROLES/ENTRYPOINTS) was captured for this repo._", ""])
 
     tb = _knowledge_doc(slug, "TRUST_BOUNDARIES.md")
     if tb:
@@ -626,7 +855,7 @@ def cmd_export_reports(args) -> None:
                         or os.environ.get("SECFORGE_TARGET_REPO") or "")
         scope = {s} if s else set()
 
-    written_reports, total_adv = [], 0
+    written_reports, total_adv, derived_docs = [], 0, 0
     for slug in sorted(scope):
         fs = sorted(all_by_slug.get(slug, []),
                     key=lambda f: (-sev_rank(f.get("severity")), f.get("title") or ""))
@@ -658,6 +887,10 @@ def cmd_export_reports(args) -> None:
                         pass
         elif sub.exists():          # repo now has no findings -> drop its folder
             shutil.rmtree(sub, ignore_errors=True)
+
+        # 1.5) derive any missing durable knowledge docs from model.json (backend-
+        # agnostic), BEFORE the report so its Authorization map reads the fresh docs.
+        derived_docs += len(_ensure_knowledge_docs(slug))
 
         # 2) executive report per repo, linking out to the advisory files
         name = _report_filename(slug)
@@ -705,6 +938,7 @@ def cmd_export_reports(args) -> None:
     _write_index(rdir, index_rows)
     _print({"reports_dir": str(rdir), "findings_dir": str(fdir),
             "regenerated": len(written_reports), "advisories_written": total_adv,
+            "knowledge_docs_derived": derived_docs,
             "index_repos": len(index_rows), "index": str(rdir / "INDEX.md")})
 
 

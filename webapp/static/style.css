@@ -148,6 +148,13 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
 .dot.on{background:var(--ok)} .dot.off{background:var(--low)}
 
+/* artifacts browser: file list beside the viewer; minmax(0,1fr) lets the viewer
+   column shrink so long log lines scroll inside it instead of widening the page */
+.art-grid{display:grid;grid-template-columns:minmax(240px,360px) minmax(0,1fr);gap:18px;align-items:start}
+.art-grid>.card{overflow-x:auto}
+.art-grid tbody tr.on{background:var(--panel2)}
+.art-grid tbody tr.on td:first-child{box-shadow:inset 3px 0 var(--accent)}
+
 /* live heartbeat: a pulsing dot + accent text on running scans */
 .live{color:var(--accent)}
 .dot.pulse{animation:pulse 1.2s ease-in-out infinite}
@@ -188,4 +195,5 @@ button[disabled]:hover{border-color:var(--line)}
   .modal{width:96vw;padding:14px}
   .log{max-height:62vh}
   button.sm{padding:6px 11px}          /* larger touch targets */
+  .art-grid{grid-template-columns:1fr}  /* file list stacks above the viewer */
 }

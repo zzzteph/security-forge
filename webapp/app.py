@@ -9,6 +9,7 @@ analysis only (no verification) — all data lives in the DB.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import secrets
 import shutil
@@ -375,7 +376,10 @@ def remove_repo(rid: int, user: str = Depends(require_user)):
 def scan_now(rid: int, user: str = Depends(require_user)):
     if not db.get_repo(rid):
         raise HTTPException(404, "no such repo")
-    return {"ok": True, "scan_id": runner.enqueue(rid, "manual")}
+    try:
+        return {"ok": True, "scan_id": runner.enqueue(rid, "manual")}
+    except runner.AlreadyQueued as e:
+        raise HTTPException(409, "a scan is already queued or running for this repository")
 
 
 # --- scans ------------------------------------------------------------------
@@ -402,7 +406,10 @@ def relaunch_scan(sid: int, user: str = Depends(require_user)):
         raise HTTPException(404, "no such scan")
     if not db.get_repo(s["repo_id"]):
         raise HTTPException(404, "repository was deleted")
-    return {"ok": True, "scan_id": runner.enqueue(s["repo_id"], "relaunch")}
+    try:
+        return {"ok": True, "scan_id": runner.enqueue(s["repo_id"], "relaunch")}
+    except runner.AlreadyQueued as e:
+        raise HTTPException(409, "a scan is already queued or running for this repository")
 
 
 @app.delete("/api/scans/{sid}")
@@ -559,6 +566,115 @@ def remove_report(uuid: str, user: str = Depends(require_user)):
         raise HTTPException(409, "cannot delete a report that is queued or running")
     db.delete_report(r["id"])
     return {"ok": True}
+
+
+# --- artifacts (observe what the orchestrator wrote on disk) ----------------
+# The orchestrator ("orca") writes the durable "map" of every scan under the data
+# root: knowledge/<slug>/ (model.json + the PROJECT/AUTH/ROLES/ENTRYPOINTS/
+# TRUST_BOUNDARIES.md recon docs + findings.json + notifications.log), reports/
+# (per-repo .md + advisories + INDEX), logs/orch-*.log (full run logs), findings/,
+# state/. None of that is in the DB, so this read-only browser surfaces the tree so
+# an operator can observe and debug exactly what a scan did. Session-gated; path is
+# resolved under the data root with traversal refused and only these folders exposed
+# (never db/ or the $HOME CLI-credential dirs on the same volume).
+_ART_ROOT = db.DATA_ROOT.resolve()
+_ART_TOP = ("knowledge", "reports", "findings", "logs", "state")
+_ART_TEXT_MAX = 2_000_000           # bytes rendered inline; larger -> download only
+_ART_MD = {".md", ".markdown"}
+_ART_JSON = {".json"}
+_ART_TEXT = {".log", ".txt", ".text", ".yaml", ".yml", ".csv", ".ini", ".cfg", ".toml",
+             ".py", ".js", ".ts", ".java", ".go", ".rb", ".php", ".sh", ".sql",
+             ".html", ".css", ".xml", ".env", ".dockerfile", ""}
+
+
+def _art_kind(p: Path) -> str:
+    ext = p.suffix.lower()
+    if ext in _ART_MD:
+        return "md"
+    if ext in _ART_JSON:
+        return "json"
+    if ext in _ART_TEXT or p.name.lower() in ("dockerfile", "makefile", "readme"):
+        return "text"
+    return "binary"
+
+
+def _art_resolve(rel: str) -> Path:
+    """Resolve a caller-supplied relative path under the data root, refusing escape.
+    '' is the root. Any path whose first segment isn't a whitelisted artifact folder
+    (or that resolves outside the root) is rejected."""
+    rel = (rel or "").strip().replace("\\", "/").lstrip("/")
+    p = (_ART_ROOT / rel).resolve()
+    if p != _ART_ROOT and _ART_ROOT not in p.parents:
+        raise HTTPException(400, "path escapes the data root")
+    if p != _ART_ROOT and p.relative_to(_ART_ROOT).parts[0] not in _ART_TOP:
+        raise HTTPException(404, "not a browsable artifact folder")
+    return p
+
+
+@app.get("/api/artifacts")
+def artifacts_list(path: str = "", user: str = Depends(require_user)):
+    """Directory listing under the data root. The root lists only the artifact
+    folders that actually exist; any deeper folder lists its real contents."""
+    p = _art_resolve(path)
+    if not p.is_dir():
+        raise HTTPException(404, "no such folder")
+    rel = "" if p == _ART_ROOT else p.relative_to(_ART_ROOT).as_posix()
+    try:
+        kids = sorted(p.iterdir(), key=lambda c: (c.is_file(), c.name.lower()))
+    except OSError:
+        kids = []
+    entries = []
+    for c in kids:
+        if p == _ART_ROOT and c.name not in _ART_TOP:
+            continue                # hide db/, home/, etc. at the root
+        try:
+            st = c.stat()
+        except OSError:
+            continue
+        entries.append({"name": c.name, "path": c.relative_to(_ART_ROOT).as_posix(),
+                        "is_dir": c.is_dir(), "size": st.st_size,
+                        "mtime": int(st.st_mtime),
+                        "kind": "dir" if c.is_dir() else _art_kind(c)})
+    return {"path": rel, "entries": entries}
+
+
+@app.get("/api/artifacts/view")
+def artifacts_view(path: str, user: str = Depends(require_user)):
+    """One file's content for inline display: markdown rendered to HTML, JSON
+    pretty-printed, text as-is. Binary or oversized files are flagged download-only."""
+    p = _art_resolve(path)
+    if not p.is_file():
+        raise HTTPException(404, "no such file")
+    st = p.stat()
+    kind = _art_kind(p)
+    out = {"path": p.relative_to(_ART_ROOT).as_posix(), "name": p.name,
+           "size": st.st_size, "mtime": int(st.st_mtime), "kind": kind}
+    if kind == "binary" or st.st_size > _ART_TEXT_MAX:
+        out["download_only"] = True
+        out["too_large"] = st.st_size > _ART_TEXT_MAX
+        return out
+    raw = p.read_text(encoding="utf-8", errors="replace")
+    if kind == "json":
+        try:
+            raw = json.dumps(json.loads(raw), indent=2, ensure_ascii=False)
+        except ValueError:
+            pass                    # not valid JSON — show the bytes as they are
+    out["raw"] = raw
+    if kind == "md":
+        out["html"] = reports.markdown_fragment(raw)
+    return out
+
+
+@app.get("/api/artifacts/raw")
+def artifacts_raw(path: str, user: str = Depends(require_user)):
+    """The raw file. Text-like files (md/json/log/…) are served inline as plain
+    text so "Raw ↗" opens them in the browser; binaries download."""
+    p = _art_resolve(path)
+    if not p.is_file():
+        raise HTTPException(404, "no such file")
+    if _art_kind(p) == "binary":
+        return FileResponse(str(p), filename=p.name)        # attachment → download
+    return FileResponse(str(p), media_type="text/plain; charset=utf-8")   # inline view
 
 
 # --- static SPA -------------------------------------------------------------

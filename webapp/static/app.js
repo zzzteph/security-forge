@@ -30,6 +30,8 @@ createApp({
       reports: [], reportView: null, reportMsg: '',   // executive reports
       pendingReport: false,   // true while a report we queued is queued/running (drives polling)
       mdRender: true,         // advisory / report viewer: rendered markdown (true) vs raw source (false)
+      art: { path: '', entries: [], file: null, loading: false },  // on-disk artifact browser
+      artRender: true,        // artifact markdown viewer: rendered (true) vs raw (false)
       // default sort so new rows land predictably (not "randomly"): repos A→Z, findings by severity
       sort: { repos: { key: 'slug', dir: 1 }, findings: { key: 'severity', dir: -1 } },
       poll: null, clock: null, nowTs: Date.now(),
@@ -97,6 +99,7 @@ createApp({
       if (view === 'projects') this.loadProjects();
       if (view === 'backends') this.loadBackends();
       if (view === 'settings') { this.loadSettings(); this.loadBackends(); }
+      if (view === 'artifacts') { this.art.file = null; this.loadArtifacts(''); }
       if (!skipHash) this.pushHash('#/' + view);
     },
     // --- shareable URLs: every view/entity maps to a hash the browser can bookmark ---
@@ -110,6 +113,7 @@ createApp({
       const id = i < 0 ? '' : raw.slice(i + 1);
       const views = ['dashboard', 'repos', 'findings', 'reports', 'scans', 'projects', 'skills', 'backends', 'settings'];
       if (!seg || views.includes(seg)) return this.go(seg || 'dashboard', true);
+      if (seg === 'artifacts') return this.openArtifacts(id || '', true);   // id = path under the data root (may contain '/')
       if (seg === 'finding' && id) { this.current = null; this.scanView = null; this.view = 'finding'; return this.openFinding({ uuid: id }, true); }
       if (seg === 'repo' && id) return this.openRepo({ id: +id }, true);
       if (seg === 'scan' && id) { this.go('scans', true); return this.openScan({ id: +id }, true); }
@@ -245,7 +249,7 @@ createApp({
     // model, keys, args) is one global template in Settings, applied to every scan.
     newRepo() {
       this.editing = 'new'; this.formErr = '';
-      this.repoForm = { url: '', name: '', cron: '', context: '', enabled: true,
+      this.repoForm = { url: '', name: '', cron: '', context: '', enabled: false,
         project_id: null, _nameTouched: false };
     },
     editRepo(r) {
@@ -281,9 +285,20 @@ createApp({
       await this.api('DELETE', '/api/repos/' + r.id); await this.loadRepos();
     },
     async runScan(r) {
-      await this.api('POST', '/api/repos/' + r.id + '/scan');
-      await this.loadRepos();
-      this.notify('Scan queued for ' + (r.name || r.slug) + '.');   // notify, don't redirect
+      // Don't let a repo be queued twice. The button is disabled while queued/running,
+      // but guard here too (double-click race, stale row) and surface the server's 409.
+      if (['queued', 'running'].includes(r.last_status)) {
+        this.notify('A scan is already ' + r.last_status + ' for ' + (r.name || r.slug) + '.');
+        return;
+      }
+      r.last_status = 'queued';   // optimistic: disable the button immediately
+      try {
+        await this.api('POST', '/api/repos/' + r.id + '/scan');
+        this.notify('Scan queued for ' + (r.name || r.slug) + '.');   // notify, don't redirect
+      } catch (e) {
+        this.notify(String(e.message || e));
+      }
+      await this.loadRepos();     // reconcile with the real status
     },
     notify(msg) {
       this.toast = msg;
@@ -317,6 +332,46 @@ createApp({
       if (!skipHash) this.pushHash('#/repo/' + r.id);
     },
     repoReports(repoId) { return (this.reports || []).filter(r => r.repo_id === repoId); },
+
+    // --- artifacts browser: observe what the orchestrator wrote on disk -------
+    async loadArtifacts(path) {
+      this.art.loading = true;
+      try {
+        const d = await this.api('GET', '/api/artifacts?path=' + encodeURIComponent(path || ''));
+        this.art.path = d.path || ''; this.art.entries = d.entries || [];
+      } catch (e) { this.art.entries = []; this.notify(String(e.message || e)); }
+      this.art.loading = false;
+    },
+    openArtifacts(path, skipHash) {
+      this.view = 'artifacts'; this.finding = null; this.current = null;
+      this.scanView = null; this.reportView = null; this.menuOpen = false;
+      this.art.file = null;
+      this.loadArtifacts(path || '');
+      if (!skipHash) this.pushHash('#/artifacts' + (path ? '/' + path : ''));
+    },
+    async openArtifact(e) {           // click a row: descend into a dir or open a file
+      if (e.is_dir) { this.openArtifacts(e.path); return; }
+      this.art.file = { loading: true, name: e.name, path: e.path, kind: e.kind };
+      try {
+        this.art.file = await this.api('GET', '/api/artifacts/view?path=' + encodeURIComponent(e.path));
+      } catch (err) { this.art.file = null; this.notify(String(err.message || err)); }
+    },
+    artCrumbs() {
+      const out = [{ name: 'data', path: '' }]; let acc = '';
+      for (const p of (this.art.path || '').split('/').filter(Boolean)) {
+        acc = acc ? acc + '/' + p : p; out.push({ name: p, path: acc });
+      }
+      return out;
+    },
+    artIcon(kind) { return { dir: '📁', md: '📝', json: '{ }', text: '📄', binary: '⬇' }[kind] || '•'; },
+    artSize(n) {
+      if (n == null) return '';
+      if (n < 1024) return n + ' B';
+      if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+      return (n / 1048576).toFixed(1) + ' MB';
+    },
+    artTime(sec) { return sec ? new Date(sec * 1000).toLocaleString() : ''; },
+    artRawUrl(path) { return '/api/artifacts/raw?path=' + encodeURIComponent(path); },
     async openFinding(f, skipHash) {
       this.view = 'finding';
       const d = await this.api('GET', '/api/findings/' + encodeURIComponent(f.uuid || f.id));
@@ -498,6 +553,7 @@ createApp({
       const liveOpen = this.isLive(this.scanView);
       if (this.view === 'scans') this.loadScans().catch(() => {});
       else if (this.view === 'dashboard') { this.loadScans().catch(() => {}); this.loadRepos().catch(() => {}); }
+      else if (this.view === 'repos') this.loadRepos().catch(() => {});   // keep Scan buttons' queued/running state fresh
       if (liveOpen) this.openScan(this.scanView).catch(() => {});
       // reports: keep the list fresh while any is queued/running, and refresh an open
       // report until it finishes generating.
@@ -551,6 +607,7 @@ createApp({
       <a :class="{on:view=='findings'||view=='finding'}" @click="go('findings')">Findings</a>
       <a :class="{on:view=='reports'||view=='report'}" @click="go('reports')">Reports</a>
       <a :class="{on:view=='scans'}" @click="go('scans')">Scans</a>
+      <a :class="{on:view=='artifacts'}" @click="go('artifacts')">Artifacts</a>
       <a :class="{on:view=='projects'}" @click="go('projects')">Projects</a>
       <a :class="{on:view=='skills'}" @click="go('skills')">Skills</a>
       <a :class="{on:view=='backends'}" @click="go('backends')">Backends</a>
@@ -641,7 +698,7 @@ createApp({
             <td><b>{{r.open_findings}}</b> <span class="muted" style="font-size:11px">{{sevList(r.by_severity)}}</span></td>
             <td><span class="pill" :class="r.last_status">{{r.last_status||'never'}}</span></td>
             <td class="nowrap right">
-              <button class="sm" @click="runScan(r)">Scan</button>
+              <button class="sm" @click="runScan(r)" :disabled="['queued','running'].includes(r.last_status)">{{r.last_status==='running'?'Running…':r.last_status==='queued'?'Queued…':'Scan'}}</button>
               <button class="sm" @click="editRepo(r)">Edit</button>
               <button class="sm danger" @click="deleteRepo(r)">✕</button></td>
           </tr>
@@ -666,6 +723,7 @@ createApp({
           <button class="sm" @click="editRepo(current.repo)">Edit</button>
           <button class="sm primary" @click="runScan(current.repo)">Scan now</button>
           <button class="sm" @click="generateReport(current.repo.id)">Generate report</button>
+          <button class="sm" @click="openArtifacts('knowledge/'+current.repo.slug)">Artifacts</button>
           <button class="sm" @click="pdf('/api/report.pdf?repo_id='+current.repo.id)">Quick PDF</button></div>
         <div class="muted" style="margin-top:8px">cron {{current.repo.cron||'—'}} · next {{fmt(current.next_run)||'—'}} · {{current.repo.enabled?'enabled':'disabled'}}</div>
         <div v-if="current.repo.context" style="margin-top:8px"><span class="muted">context:</span> {{current.repo.context}}</div>
@@ -858,6 +916,52 @@ createApp({
           <label class="switch"><input type="checkbox" v-model="mdRender"><span class="track"></span>Rendered</label></div>
         <div v-if="mdRender" class="md" v-html="reportView._html"></div>
         <pre v-else>{{reportView.markdown}}</pre>
+      </div>
+    </div>
+
+    <!-- ARTIFACTS (observe what the orchestrator wrote on disk) -->
+    <div v-if="view=='artifacts'">
+      <div class="card">
+        <div class="muted" style="font-size:12.5px;margin-bottom:8px">Everything the orchestrator writes per scan — the recon <b>map</b> (model.json + PROJECT/AUTH/ROLES/ENTRYPOINTS/TRUST_BOUNDARIES), per-repo reports &amp; advisories, and full run logs. Read-only.</div>
+        <div class="flex" style="gap:6px;flex-wrap:wrap">
+          <template v-for="(c,i) in artCrumbs()" :key="c.path">
+            <a @click="openArtifacts(c.path)" class="mono">{{c.name}}</a>
+            <span v-if="i < artCrumbs().length-1" class="muted">/</span>
+          </template>
+          <span class="spacer"></span>
+          <span v-if="art.loading" class="muted" style="font-size:12px">loading…</span>
+        </div>
+      </div>
+      <div class="art-grid">
+        <div class="card" style="margin:0">
+          <table>
+            <thead><tr><th>Name</th><th class="right">Size</th><th class="nowrap">Modified</th></tr></thead>
+            <tbody>
+              <tr v-for="e in art.entries" :key="e.path" style="cursor:pointer"
+                  :class="{on: art.file && art.file.path===e.path}" @click="openArtifact(e)">
+                <td><span style="display:inline-block;width:20px">{{artIcon(e.kind)}}</span>{{e.name}}</td>
+                <td class="muted right nowrap">{{e.is_dir ? '' : artSize(e.size)}}</td>
+                <td class="muted nowrap" style="font-size:12px">{{artTime(e.mtime)}}</td></tr>
+              <tr v-if="!art.entries.length"><td colspan="3" class="muted">{{art.loading ? 'Loading…' : 'Empty — nothing written here yet. Run a scan to populate it.'}}</td></tr>
+            </tbody></table>
+        </div>
+        <div class="card" style="margin:0">
+          <div v-if="!art.file" class="muted">Select a file to view it. Markdown renders; JSON is pretty-printed; logs show as text.</div>
+          <div v-else>
+            <div class="flex" style="margin-bottom:8px">
+              <b class="mono" style="word-break:break-all">{{art.file.name}}</b><span class="spacer"></span>
+              <label v-if="art.file.kind==='md' && !art.file.download_only" class="switch"><input type="checkbox" v-model="artRender"><span class="track"></span>Rendered</label>
+              <a :href="artRawUrl(art.file.path)" target="_blank" rel="noopener" style="margin-left:10px;font-size:13px">Raw ↗</a>
+            </div>
+            <div v-if="art.file.loading" class="muted">Loading…</div>
+            <div v-else-if="art.file.download_only" class="muted">
+              {{art.file.too_large ? 'Too large to show inline' : 'Binary file'}} ({{artSize(art.file.size)}}) —
+              <a :href="artRawUrl(art.file.path)" target="_blank" rel="noopener">download</a>.
+            </div>
+            <div v-else-if="art.file.kind==='md' && artRender" class="md" v-html="art.file.html"></div>
+            <pre v-else class="log" style="white-space:pre-wrap;word-break:break-word">{{art.file.raw}}</pre>
+          </div>
+        </div>
       </div>
     </div>
 

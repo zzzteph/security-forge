@@ -413,6 +413,15 @@ def create_scan(repo_id: int, slug: str, trigger: str = "manual") -> int:
         return cur.lastrowid
 
 
+def active_scan_id(repo_id: int) -> int | None:
+    """The id of this repo's already-queued-or-running scan, or None. Used to stop a
+    repo being enqueued twice (double-click, two tabs, cron overlapping a manual run)."""
+    with connect() as c:
+        r = c.execute("SELECT id FROM scans WHERE repo_id=? AND status IN ('queued','running') "
+                      "ORDER BY id DESC LIMIT 1", (repo_id,)).fetchone()
+    return r["id"] if r else None
+
+
 def update_scan(sid: int, **kw) -> None:
     if not kw:
         return

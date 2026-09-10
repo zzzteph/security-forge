@@ -58,12 +58,30 @@ def _submit(job: _Job) -> None:
     _q.put((_PRIORITY.get(job.kind, 50), next(_seq), job))
 
 
+class AlreadyQueued(Exception):
+    """A scan for this repo is already queued or running."""
+    def __init__(self, scan_id: int):
+        self.scan_id = scan_id
+        super().__init__(f"scan {scan_id} already queued/running")
+
+
 def enqueue(repo_id: int, trigger: str = "manual") -> int:
-    """Queue a scan for a repo. Returns the scan id (created immediately as queued)."""
+    """Queue a scan for a repo. Returns the scan id (created immediately as queued).
+    Idempotent per repo: if a scan is already queued or running, no second scan is
+    created — raises AlreadyQueued(existing_scan_id) so callers can react (the API
+    turns it into a 409; the scheduler just skips)."""
     repo = db.get_repo(repo_id)
     if not repo:
         raise ValueError("no such repo")
+    existing = db.active_scan_id(repo_id)
+    if existing is not None:
+        raise AlreadyQueued(existing)
     scan_id = db.create_scan(repo_id, repo["slug"], trigger)
+    # Reflect "queued" on the repo row now (not only when the worker starts it), so the
+    # UI disables the Scan button immediately and the "Last" pill reads queued.
+    with db.connect() as c:
+        c.execute("UPDATE repos SET last_scan_id=?, last_status='queued', updated=? WHERE id=?",
+                  (scan_id, db._now(), repo_id))
     _submit(_Job("scan", repo_id, scan_id, trigger))
     return scan_id
 
@@ -152,10 +170,13 @@ def _run_scan(repo_id: int, scan_id: int) -> None:
         return
     slug = repo["slug"]
     db.update_scan(scan_id, status="running", started=db._now())
-    db.upsert_repo({"url": repo["url"]}, repo_id)  # touch updated
+    # Mark running + touch `updated` WITHOUT a full upsert_repo: passing a partial
+    # dict to upsert_repo would UPDATE every column from defaults, silently blanking
+    # project_id (un-assigning the repo from its project), context, backend, cron…
+    # on every single scan. Only touch the columns this actually owns.
     with db.connect() as c:
-        c.execute("UPDATE repos SET last_scan_id=?, last_status='running' WHERE id=?",
-                  (scan_id, repo_id))
+        c.execute("UPDATE repos SET last_scan_id=?, last_status='running', updated=? "
+                  "WHERE id=?", (scan_id, db._now(), repo_id))
 
     # The AI is ONE global template applied to every scan (backend/model/keys/args).
     # A repository only contributes WHAT to scan and its per-repo context.
