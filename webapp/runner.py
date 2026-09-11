@@ -45,6 +45,7 @@ class _Job:
     repo_id: int | None
     ref_id: int        # scan_id or report_id
     trigger: str
+    effort: str | None = None   # per-scan reasoning-effort override (else the global default)
 
 
 _q: "queue.PriorityQueue[tuple[int, int, _Job]]" = queue.PriorityQueue()
@@ -65,8 +66,10 @@ class AlreadyQueued(Exception):
         super().__init__(f"scan {scan_id} already queued/running")
 
 
-def enqueue(repo_id: int, trigger: str = "manual") -> int:
+def enqueue(repo_id: int, trigger: str = "manual", effort: str | None = None) -> int:
     """Queue a scan for a repo. Returns the scan id (created immediately as queued).
+    `effort` overrides the global reasoning-effort for THIS scan only (the per-scan
+    slider); None uses the global default.
     Idempotent per repo: if a scan is already queued or running, no second scan is
     created — raises AlreadyQueued(existing_scan_id) so callers can react (the API
     turns it into a 409; the scheduler just skips)."""
@@ -82,7 +85,7 @@ def enqueue(repo_id: int, trigger: str = "manual") -> int:
     with db.connect() as c:
         c.execute("UPDATE repos SET last_scan_id=?, last_status='queued', updated=? WHERE id=?",
                   (scan_id, db._now(), repo_id))
-    _submit(_Job("scan", repo_id, scan_id, trigger))
+    _submit(_Job("scan", repo_id, scan_id, trigger, effort))
     return scan_id
 
 
@@ -163,7 +166,7 @@ def _load_model(slug: str) -> dict | None:
         return None
 
 
-def _run_scan(repo_id: int, scan_id: int) -> None:
+def _run_scan(repo_id: int, scan_id: int, effort: str | None = None) -> None:
     repo = db.get_repo(repo_id)
     if not repo:
         db.update_scan(scan_id, status="error", error="repo deleted", finished=db._now())
@@ -190,10 +193,17 @@ def _run_scan(repo_id: int, scan_id: int) -> None:
     for flag, key in [("--model", "model"), ("--agent-base-url", "base_url"),
                       ("--agent-max-turns", "max_turns"),
                       ("--agent-temperature", "temperature"), ("--timeout", "timeout"),
+                      ("--agent-effort", "effort"), ("--agent-fanout", "fanout"),
+                      ("--agent-subagents", "max_subagents"),
+                      ("--agent-subagent-turns", "subagent_turns"),
                       ("--agent-cmd", "agent_cmd"), ("--agent-output", "agent_output")]:
         val = cfg.get(key)
         if val not in (None, ""):
             cmd += [flag, str(val)]
+    # Per-scan effort override (the Scan-dialog slider) wins over the global default —
+    # appended last so the orchestrator's argparse takes this value.
+    if effort:
+        cmd += ["--agent-effort", str(effort)]
     if cfg.get("extra_args"):
         try:
             extra = shlex.split(cfg["extra_args"])
@@ -356,7 +366,7 @@ def _worker() -> None:
             if job.kind == "report":
                 _run_report(job.ref_id)
             else:
-                _run_scan(job.repo_id, job.ref_id)
+                _run_scan(job.repo_id, job.ref_id, job.effort)
         except Exception as e:  # noqa: BLE001  (never let the worker die)
             try:
                 if job.kind == "report":

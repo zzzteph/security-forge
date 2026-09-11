@@ -45,7 +45,8 @@ app.add_middleware(SessionMiddleware, secret_key=_secret, https_only=False,
 # run to completion) — the default the user asked for.
 DEFAULT_DEFAULTS = {"backend": "litellm", "model": "", "base_url": "", "max_turns": "",
                     "temperature": "", "timeout": "0", "agent_cmd": "", "agent_output": "",
-                    "extra_args": "", "env": []}
+                    "extra_args": "", "env": [], "effort": "max",
+                    "fanout": "forced", "max_subagents": 6, "subagent_turns": 40}
 
 
 @app.on_event("startup")
@@ -372,12 +373,22 @@ def remove_repo(rid: int, user: str = Depends(require_user)):
     return {"ok": True}
 
 
+# Per-scan effort levels the Scan dialog's slider can request (maps per model in the
+# litellm agent). Anything else is ignored so a scan falls back to the global default.
+_EFFORT_LEVELS = {"low", "medium", "high", "max", "normal", "off"}
+
+
+def _clean_effort(effort: str | None) -> str | None:
+    e = (effort or "").strip().lower()
+    return e if e in _EFFORT_LEVELS else None
+
+
 @app.post("/api/repos/{rid}/scan")
-def scan_now(rid: int, user: str = Depends(require_user)):
+def scan_now(rid: int, effort: str | None = None, user: str = Depends(require_user)):
     if not db.get_repo(rid):
         raise HTTPException(404, "no such repo")
     try:
-        return {"ok": True, "scan_id": runner.enqueue(rid, "manual")}
+        return {"ok": True, "scan_id": runner.enqueue(rid, "manual", _clean_effort(effort))}
     except runner.AlreadyQueued as e:
         raise HTTPException(409, "a scan is already queued or running for this repository")
 
@@ -399,7 +410,7 @@ def scan_detail(sid: int, user: str = Depends(require_user)):
 
 
 @app.post("/api/scans/{sid}/relaunch")
-def relaunch_scan(sid: int, user: str = Depends(require_user)):
+def relaunch_scan(sid: int, effort: str | None = None, user: str = Depends(require_user)):
     """Re-run the same repository as a fresh scan (a new run record)."""
     s = db.get_scan(sid)
     if not s:
@@ -407,7 +418,7 @@ def relaunch_scan(sid: int, user: str = Depends(require_user)):
     if not db.get_repo(s["repo_id"]):
         raise HTTPException(404, "repository was deleted")
     try:
-        return {"ok": True, "scan_id": runner.enqueue(s["repo_id"], "relaunch")}
+        return {"ok": True, "scan_id": runner.enqueue(s["repo_id"], "relaunch", _clean_effort(effort))}
     except runner.AlreadyQueued as e:
         raise HTTPException(409, "a scan is already queued or running for this repository")
 

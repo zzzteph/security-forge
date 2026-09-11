@@ -37,6 +37,32 @@ def _sec(title: str, body) -> str:
     return f"## {title}\n\n{body}\n\n" if body else ""
 
 
+def _deep_exploration(f: dict) -> str:
+    """Surface the deep per-finding analysis the engine captured but that isn't a
+    first-class column: its false-positive self-check and the timestamped analysis
+    trail (re-scoping, source->sink reasoning). Parsed from `raw` so every finding
+    shows the full depth it was analyzed with; '' when the engine recorded none."""
+    try:
+        extra = json.loads(f.get("raw") or "{}")
+    except (ValueError, TypeError):
+        return ""
+    if not isinstance(extra, dict):
+        return ""
+    out = _sec("False-positive self-check", extra.get("fp_filter_checked"))
+    notes = extra.get("notes")
+    if isinstance(notes, list):
+        lines = []
+        for n in notes:
+            if isinstance(n, dict) and (n.get("note") or "").strip():
+                ts = str(n.get("ts") or "")[:19].replace("T", " ")
+                lines.append(f"- {('`' + ts + '` — ') if ts else ''}{n['note'].strip()}")
+            elif isinstance(n, str) and n.strip():
+                lines.append(f"- {n.strip()}")
+        if lines:
+            out += "## Analysis trail\n\n" + "\n".join(lines) + "\n\n"
+    return out
+
+
 def advisory_markdown(f: dict) -> str:
     sev = (f.get("severity") or "NA").upper()
     loc = f.get("file") or ""
@@ -65,6 +91,9 @@ def advisory_markdown(f: dict) -> str:
         md.append("## Proof of concept\n\n```\n" + str(f["poc"]).strip() + "\n```\n\n")
     md.append(_sec("Remediation", f.get("remediation")))
     md.append(_sec("Severity rationale", f.get("severity_rationale")))
+    if f.get("entrypoint"):
+        md.append(_sec("Affected entry points", f.get("entrypoint")))
+    md.append(_deep_exploration(f))
     md.append(f"\n---\n*Finding `{f.get('fid') or f.get('id')}` · "
               f"first seen {f.get('first_seen')} · last seen {f.get('last_seen')}*\n")
     return "".join(md)

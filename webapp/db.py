@@ -1115,7 +1115,10 @@ def review_hints(f: dict) -> list[dict]:
                 if len(ln) < 6:
                     continue
                 shared = fterms & _hint_terms(ln)
-                if (shared & _AUTH_SIGNALS) or len(shared) >= 2:
+                # Require >=2 CONCRETE shared terms (auth-signal words alone don't
+                # count) — otherwise one shared "access"/"token" attaches the same
+                # ground-truth line to every auth finding in the project.
+                if len(shared - _AUTH_SIGNALS) >= 2:
                     hints.append({
                         "source": f"Project ground truth ({project['name']})",
                         "reason": f"The project declares as fact: “{ln}” — if this "
@@ -1133,17 +1136,32 @@ def review_hints(f: dict) -> list[dict]:
         qmarks = ",".join("?" * len(scope_ids))
 
         # 2) sibling service cards — auth enforced elsewhere, or the caller is authed.
-        if auth_related and project:
+        # The finding's own surface (route/identifier tokens, auth-signal words
+        # dropped). A sibling hint only fires when the sibling shares this surface —
+        # enumerating every sibling that "enforces authz somewhere" is what made the
+        # same boilerplate appear on every finding. Capped at 2 sibling hints.
+        surface = _hint_terms(f.get("entrypoint"), f.get("title"), f.get("file")) - _AUTH_SIGNALS
+        sib_start = len(hints)
+        if auth_related and project and surface:
             for s in c.execute(
                     "SELECT sc.slug AS slug, sc.card_json AS cj FROM service_cards sc "
                     "JOIN repos rp ON rp.id=sc.repo_id WHERE rp.project_id=? AND sc.repo_id!=?",
                     (project["pid"], repo_id)).fetchall():
+                if len(hints) - sib_start >= 2:
+                    break
                 try:
                     card = json.loads(s["cj"])
                 except (ValueError, TypeError):
                     continue
+                # concrete overlap between this finding's surface and the sibling's
+                # exposed routes + outbound call targets (not generic auth words).
+                sib_surface = _hint_terms(
+                    " ".join((e.get("route") or "") for e in (card.get("exposes") or [])
+                             if isinstance(e, dict)),
+                    " ".join((cl.get("target") or "") for cl in (card.get("calls") or [])
+                             if isinstance(cl, dict))) - _AUTH_SIGNALS
                 enf = (card.get("authz") or {}).get("enforced_at")
-                if enf:
+                if enf and (surface & sib_surface):
                     hints.append({
                         "source": f"Sibling service “{s['slug']}”",
                         "reason": f"“{s['slug']}” enforces authorization at {enf}. If this "

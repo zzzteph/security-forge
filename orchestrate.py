@@ -494,12 +494,17 @@ class LiteLLMBackend(AgentBackend):
     name = "litellm"
 
     def __init__(self, max_turns=None, temperature=None, max_context_tokens=None,
-                 api_base=None):
+                 api_base=None, effort=None, fanout=None, max_subagents=None,
+                 subagent_turns=None):
         self.script = ROOT / "scripts" / "litellm_agent.py"
         self.max_turns = max_turns
         self.temperature = temperature
         self.max_context_tokens = max_context_tokens
         self.api_base = api_base
+        self.effort = effort
+        self.fanout = fanout                    # forced | auto | off
+        self.max_subagents = max_subagents      # budget; 0 = flat single loop
+        self.subagent_turns = subagent_turns    # turns per spawned subagent
 
     def build_command(self, prompt: str, model: str) -> list[str]:
         cmd = [PY, str(self.script), "--model", model or "", "--prompt", prompt]
@@ -511,6 +516,14 @@ class LiteLLMBackend(AgentBackend):
             cmd += ["--max-context-tokens", str(self.max_context_tokens)]
         if self.api_base:
             cmd += ["--api-base", self.api_base]
+        if self.effort:
+            cmd += ["--effort", str(self.effort)]
+        if self.fanout:
+            cmd += ["--fanout", str(self.fanout)]
+        if self.max_subagents is not None:
+            cmd += ["--max-subagents", str(self.max_subagents)]
+        if self.subagent_turns:
+            cmd += ["--subagent-turns", str(self.subagent_turns)]
         return cmd
 
     def progress(self, log_path: Path):
@@ -637,7 +650,14 @@ def resolve_backend(args, cfg: dict) -> AgentBackend:
                 else lc.get("temperature"))
         mct = lc.get("max_context_tokens")
         base = (args.agent_base_url or lc.get("api_base") or "").strip() or None
-        return LiteLLMBackend(mt, temp, mct, base)
+        # Reasoning effort + subagent depth: explicit flag > config > default.
+        effort = (args.agent_effort or lc.get("effort") or "max").strip()
+        fanout = (args.agent_fanout or lc.get("fanout") or "forced").strip()
+        subs = (args.agent_subagents if args.agent_subagents is not None
+                else lc.get("max_subagents"))
+        subs = 6 if subs is None else int(subs)
+        subturns = int(args.agent_subagent_turns or lc.get("subagent_turns") or 40)
+        return LiteLLMBackend(mt, temp, mct, base, effort, fanout, subs, subturns)
 
     if name == "cli-adapter":
         cli = cfg.get("cli") or {}
@@ -850,6 +870,20 @@ def main():
                          "default 500). The per-repo --timeout still bounds wall clock.")
     ap.add_argument("--agent-temperature", type=float, default=None,
                     help="litellm backend: sampling temperature (provider default if unset)")
+    ap.add_argument("--agent-effort", default="",
+                    help="litellm backend: reasoning level low|medium|high|max, mapped per "
+                         "model (Anthropic output_config.effort; others reasoning_effort). "
+                         "Default 'max'.")
+    ap.add_argument("--agent-fanout", default="",
+                    help="litellm backend: subagent depth strategy forced|auto|off "
+                         "(default 'forced' - deterministically spawns recon+authz+"
+                         "dataflow+logic like Claude).")
+    ap.add_argument("--agent-subagents", type=int, default=None,
+                    help="litellm backend: max specialist subagents per run (default 6; "
+                         "0 = flat single loop, no fan-out).")
+    ap.add_argument("--agent-subagent-turns", type=int, default=0,
+                    help="litellm backend: max tool-use turns per spawned subagent "
+                         "(default 40).")
     ap.add_argument("--agent-base-url", default="",
                     help="litellm backend: override the model endpoint URL (a "
                          "self-hosted OpenAI-compatible server, Ollama/vLLM, or a "

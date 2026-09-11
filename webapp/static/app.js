@@ -20,8 +20,11 @@ createApp({
       skills: [], skillForm: null, skillErr: '',
       projects: [], projectForm: null, projectErr: '', repoSearch: '',
       settings: { defaults: { backend: 'litellm', model: '', base_url: '', max_turns: '',
-        temperature: '', timeout: '', agent_cmd: '', agent_output: '', extra_args: '', env: [] },
+        temperature: '', timeout: '', agent_cmd: '', agent_output: '', extra_args: '', env: [],
+        effort: 'max', fanout: 'forced', max_subagents: 6, subagent_turns: 40 },
         max_concurrent_scans: 1 },
+      scanModal: null,        // per-scan effort chooser (slider) shown when clicking Scan
+      EFFORTS: ['low', 'medium', 'high', 'max'],
       settingsMsg: '',
       editing: null, repoForm: null, formErr: '',
       current: null,          // repo detail
@@ -163,6 +166,10 @@ createApp({
       const s = await this.api('GET', '/api/settings');
       if (!s.defaults) s.defaults = {};
       if (!Array.isArray(s.defaults.env)) s.defaults.env = [];
+      if (s.defaults.effort === undefined || s.defaults.effort === '') s.defaults.effort = 'max';
+      if (s.defaults.fanout === undefined || s.defaults.fanout === '') s.defaults.fanout = 'forced';
+      if (s.defaults.max_subagents === undefined) s.defaults.max_subagents = 6;
+      if (s.defaults.subagent_turns === undefined) s.defaults.subagent_turns = 40;
       // Secrets arrive masked by default; _show is a per-row reveal toggle (UI-only).
       s.defaults.env.forEach(e => { e._show = false; });
       this.settings = s;
@@ -284,17 +291,26 @@ createApp({
       if (!confirm('Delete ' + r.slug + ' and its findings?')) return;
       await this.api('DELETE', '/api/repos/' + r.id); await this.loadRepos();
     },
-    async runScan(r) {
-      // Don't let a repo be queued twice. The button is disabled while queued/running,
-      // but guard here too (double-click race, stale row) and surface the server's 409.
+    runScan(r) {
+      // Don't let a repo be queued twice (button is disabled while queued/running,
+      // but guard here too for a double-click race / stale row).
       if (['queued', 'running'].includes(r.last_status)) {
         this.notify('A scan is already ' + r.last_status + ' for ' + (r.name || r.slug) + '.');
         return;
       }
+      // Open the per-scan effort chooser; slider defaults to Medium (index 2).
+      this.scanModal = { repo: r, level: 2 };
+    },
+    effortLabel(level) { return this.EFFORTS[Math.min(Math.max(level, 1), 4) - 1]; },
+    async startScan() {
+      const m = this.scanModal;
+      if (!m) return;
+      const r = m.repo, effort = this.effortLabel(m.level);
+      this.scanModal = null;
       r.last_status = 'queued';   // optimistic: disable the button immediately
       try {
-        await this.api('POST', '/api/repos/' + r.id + '/scan');
-        this.notify('Scan queued for ' + (r.name || r.slug) + '.');   // notify, don't redirect
+        await this.api('POST', '/api/repos/' + r.id + '/scan?effort=' + encodeURIComponent(effort));
+        this.notify('Scan queued for ' + (r.name || r.slug) + ' — ' + effort + ' effort.');
       } catch (e) {
         this.notify(String(e.message || e));
       }
@@ -1087,11 +1103,27 @@ createApp({
           <div><label>Timeout — seconds per scan (0 = no limit)</label><input class="mono" v-model="settings.defaults.timeout" placeholder="0"></div></div>
         <div class="row"><div><label>Max turns</label><input class="mono" v-model="settings.defaults.max_turns" placeholder="500"></div>
           <div><label>Temperature</label><input class="mono" v-model="settings.defaults.temperature"></div></div>
+        <div class="row"><div><label>Reasoning effort (default)</label>
+          <select v-model="settings.defaults.effort">
+            <option value="off">Provider default</option>
+            <option value="low">Low</option>
+            <option value="medium">Medium</option>
+            <option value="high">High</option>
+            <option value="max">Max</option></select></div>
+          <div><label>Subagent depth (fan-out)</label>
+          <select v-model="settings.defaults.fanout">
+            <option value="forced">Forced — recon+authz+dataflow+logic (like Claude)</option>
+            <option value="auto">Auto — the model decides</option>
+            <option value="off">Off — single flat loop</option></select></div></div>
+        <div class="row"><div><label>Max subagents</label><input class="mono" type="number" min="0" v-model.number="settings.defaults.max_subagents" placeholder="6"></div>
+          <div><label>Turns per subagent</label><input class="mono" type="number" min="1" v-model.number="settings.defaults.subagent_turns" placeholder="40"></div></div>
         <div class="muted" style="font-size:12px;margin-top:6px">
           <b>Timeout</b>: seconds before a scan is stopped — <b>0 = no limit</b> (default; let the scan run to completion). ·
-          <b>Max turns</b>: how many tool-use steps (LLM round-trips) the agent may take in one scan — the main safety bound when there's no timeout; blank = 500. ·
+          <b>Max turns</b>: how many tool-use steps the agent may take in one scan; blank = 500. ·
           <b>Base URL</b>: point at a self-hosted/OpenAI-compatible endpoint or LiteLLM proxy. ·
-          <b>Temperature</b>: sampling randomness; blank = the model's default.
+          <b>Temperature</b>: sampling randomness; blank = the model's default. ·
+          <b>Reasoning effort</b> (litellm): one scale mapped per model — Anthropic <span class="mono">output_config.effort</span>, OpenAI/others <span class="mono">reasoning_effort</span>. The default for every scan; the Scan button lets you override it per run. ·
+          <b>Subagent depth</b> (litellm): <b>Forced</b> deterministically spawns recon + authz + dataflow + logic specialists (Claude-style breadth, higher cost); <b>Off</b> is the cheap single loop. <b>Max subagents</b>/<b>Turns per subagent</b> bound the fan-out.
         </div>
         <label>Extra orchestrator args</label><input class="mono" v-model="settings.defaults.extra_args">
         <label>Environment — provider keys / base URLs (sent to every scan)</label>
@@ -1113,6 +1145,24 @@ createApp({
     </div>
   </div>
 </div>
+
+<!-- PER-SCAN EFFORT CHOOSER -->
+<div v-if="scanModal" class="modal-bg" @click.self="scanModal=null"><div class="modal" style="width:min(460px,94vw)">
+  <div class="flex"><h2 style="margin:0">Scan {{scanModal.repo.name||scanModal.repo.slug}}</h2>
+    <span class="spacer"></span><button class="sm" @click="scanModal=null">✕</button></div>
+  <div style="margin:16px 0 6px"><label style="margin:0">How much effort for this scan?</label></div>
+  <input type="range" min="1" max="4" step="1" v-model.number="scanModal.level" style="width:100%">
+  <div class="flex" style="justify-content:space-between;font-size:12px;color:var(--muted);margin-top:2px">
+    <span :style="scanModal.level==1?'color:var(--accent);font-weight:700':''">Low</span>
+    <span :style="scanModal.level==2?'color:var(--accent);font-weight:700':''">Medium</span>
+    <span :style="scanModal.level==3?'color:var(--accent);font-weight:700':''">High</span>
+    <span :style="scanModal.level==4?'color:var(--accent);font-weight:700':''">Max</span></div>
+  <div style="margin-top:12px;font-size:13px">Selected: <b style="text-transform:capitalize">{{effortLabel(scanModal.level)}}</b>
+    <span class="muted"> — higher = deeper reasoning &amp; more thorough, at higher cost. Global default is <b>{{settings.defaults.effort}}</b>.</span></div>
+  <div style="margin-top:18px;display:flex;gap:8px;justify-content:flex-end">
+    <button class="sm" @click="scanModal=null">Cancel</button>
+    <button class="primary" @click="startScan()">Start scan</button></div>
+</div></div>
 
 <!-- CHANGE PASSWORD (forced) -->
 <div v-if="me && pw.show" class="modal-bg"><div class="modal">
