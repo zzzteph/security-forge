@@ -298,19 +298,19 @@ createApp({
         this.notify('A scan is already ' + r.last_status + ' for ' + (r.name || r.slug) + '.');
         return;
       }
-      // Open the per-scan effort chooser; slider defaults to Medium (index 2).
-      this.scanModal = { repo: r, level: 2 };
+      // Open the per-scan chooser; slider defaults to Medium (index 2), fresh off.
+      this.scanModal = { repo: r, level: 2, fresh: false };
     },
     effortLabel(level) { return this.EFFORTS[Math.min(Math.max(level, 1), 4) - 1]; },
     async startScan() {
       const m = this.scanModal;
       if (!m) return;
-      const r = m.repo, effort = this.effortLabel(m.level);
+      const r = m.repo, effort = this.effortLabel(m.level), fresh = !!m.fresh;
       this.scanModal = null;
       r.last_status = 'queued';   // optimistic: disable the button immediately
       try {
-        await this.api('POST', '/api/repos/' + r.id + '/scan?effort=' + encodeURIComponent(effort));
-        this.notify('Scan queued for ' + (r.name || r.slug) + ' — ' + effort + ' effort.');
+        await this.api('POST', '/api/repos/' + r.id + '/scan?effort=' + encodeURIComponent(effort) + '&fresh=' + fresh);
+        this.notify('Scan queued for ' + (r.name || r.slug) + ' — ' + effort + ' effort' + (fresh ? ', fresh model' : '') + '.');
       } catch (e) {
         this.notify(String(e.message || e));
       }
@@ -1159,6 +1159,8 @@ createApp({
     <span :style="scanModal.level==4?'color:var(--accent);font-weight:700':''">Max</span></div>
   <div style="margin-top:12px;font-size:13px">Selected: <b style="text-transform:capitalize">{{effortLabel(scanModal.level)}}</b>
     <span class="muted"> — higher = deeper reasoning &amp; more thorough, at higher cost. Global default is <b>{{settings.defaults.effort}}</b>.</span></div>
+  <label class="switch" style="margin-top:14px"><input type="checkbox" v-model="scanModal.fresh"><span class="track"></span>Fresh scan — rebuild the model</label>
+  <div class="muted" style="font-size:12px;margin-top:4px">Clears this repo's cached <span class="mono">model.json</span> so recon re-derives it (a BASELINE run). Findings are kept for reconciliation. Use when the model looks stale/wrong; otherwise a re-scan reuses the cached model (incremental).</div>
   <div style="margin-top:18px;display:flex;gap:8px;justify-content:flex-end">
     <button class="sm" @click="scanModal=null">Cancel</button>
     <button class="primary" @click="startScan()">Start scan</button></div>

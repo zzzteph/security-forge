@@ -384,11 +384,12 @@ def _clean_effort(effort: str | None) -> str | None:
 
 
 @app.post("/api/repos/{rid}/scan")
-def scan_now(rid: int, effort: str | None = None, user: str = Depends(require_user)):
+def scan_now(rid: int, effort: str | None = None, fresh: bool = False,
+             user: str = Depends(require_user)):
     if not db.get_repo(rid):
         raise HTTPException(404, "no such repo")
     try:
-        return {"ok": True, "scan_id": runner.enqueue(rid, "manual", _clean_effort(effort))}
+        return {"ok": True, "scan_id": runner.enqueue(rid, "manual", _clean_effort(effort), fresh)}
     except runner.AlreadyQueued as e:
         raise HTTPException(409, "a scan is already queued or running for this repository")
 
@@ -410,7 +411,8 @@ def scan_detail(sid: int, user: str = Depends(require_user)):
 
 
 @app.post("/api/scans/{sid}/relaunch")
-def relaunch_scan(sid: int, effort: str | None = None, user: str = Depends(require_user)):
+def relaunch_scan(sid: int, effort: str | None = None, fresh: bool = False,
+                  user: str = Depends(require_user)):
     """Re-run the same repository as a fresh scan (a new run record)."""
     s = db.get_scan(sid)
     if not s:
@@ -418,7 +420,7 @@ def relaunch_scan(sid: int, effort: str | None = None, user: str = Depends(requi
     if not db.get_repo(s["repo_id"]):
         raise HTTPException(404, "repository was deleted")
     try:
-        return {"ok": True, "scan_id": runner.enqueue(s["repo_id"], "relaunch", _clean_effort(effort))}
+        return {"ok": True, "scan_id": runner.enqueue(s["repo_id"], "relaunch", _clean_effort(effort), fresh)}
     except runner.AlreadyQueued as e:
         raise HTTPException(409, "a scan is already queued or running for this repository")
 

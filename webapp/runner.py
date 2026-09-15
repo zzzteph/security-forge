@@ -46,6 +46,7 @@ class _Job:
     ref_id: int        # scan_id or report_id
     trigger: str
     effort: str | None = None   # per-scan reasoning-effort override (else the global default)
+    fresh: bool = False         # per-scan: force a BASELINE rebuild (clear cached model)
 
 
 _q: "queue.PriorityQueue[tuple[int, int, _Job]]" = queue.PriorityQueue()
@@ -66,10 +67,12 @@ class AlreadyQueued(Exception):
         super().__init__(f"scan {scan_id} already queued/running")
 
 
-def enqueue(repo_id: int, trigger: str = "manual", effort: str | None = None) -> int:
+def enqueue(repo_id: int, trigger: str = "manual", effort: str | None = None,
+            fresh: bool = False) -> int:
     """Queue a scan for a repo. Returns the scan id (created immediately as queued).
     `effort` overrides the global reasoning-effort for THIS scan only (the per-scan
-    slider); None uses the global default.
+    slider); None uses the global default. `fresh` forces a BASELINE rebuild (clears
+    the cached model so recon re-derives it).
     Idempotent per repo: if a scan is already queued or running, no second scan is
     created — raises AlreadyQueued(existing_scan_id) so callers can react (the API
     turns it into a 409; the scheduler just skips)."""
@@ -85,7 +88,7 @@ def enqueue(repo_id: int, trigger: str = "manual", effort: str | None = None) ->
     with db.connect() as c:
         c.execute("UPDATE repos SET last_scan_id=?, last_status='queued', updated=? WHERE id=?",
                   (scan_id, db._now(), repo_id))
-    _submit(_Job("scan", repo_id, scan_id, trigger, effort))
+    _submit(_Job("scan", repo_id, scan_id, trigger, effort, fresh))
     return scan_id
 
 
@@ -166,7 +169,8 @@ def _load_model(slug: str) -> dict | None:
         return None
 
 
-def _run_scan(repo_id: int, scan_id: int, effort: str | None = None) -> None:
+def _run_scan(repo_id: int, scan_id: int, effort: str | None = None,
+              fresh: bool = False) -> None:
     repo = db.get_repo(repo_id)
     if not repo:
         db.update_scan(scan_id, status="error", error="repo deleted", finished=db._now())
@@ -204,6 +208,8 @@ def _run_scan(repo_id: int, scan_id: int, effort: str | None = None) -> None:
     # appended last so the orchestrator's argparse takes this value.
     if effort:
         cmd += ["--agent-effort", str(effort)]
+    if fresh:
+        cmd += ["--fresh"]   # per-scan: force a BASELINE rebuild of the cached model
     if cfg.get("extra_args"):
         try:
             extra = shlex.split(cfg["extra_args"])
@@ -366,7 +372,7 @@ def _worker() -> None:
             if job.kind == "report":
                 _run_report(job.ref_id)
             else:
-                _run_scan(job.repo_id, job.ref_id, job.effort)
+                _run_scan(job.repo_id, job.ref_id, job.effort, job.fresh)
         except Exception as e:  # noqa: BLE001  (never let the worker die)
             try:
                 if job.kind == "report":

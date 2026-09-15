@@ -730,6 +730,10 @@ def process_repo(t: dict, args, logs: Path, idx: int, total) -> str:
         orgdb("set-status", "--slug", slug, "--status", "error", "--error", detail)
         print(f"[orch]   ✗ prep failed: {detail} — skipped (no agent session spent)")
         return "error"
+    if getattr(args, "fresh", False):
+        fresh_baseline_wipe(slug)
+        print(f"[orch]   ↻ fresh: cleared cached model for {slug} → BASELINE rebuild",
+              flush=True)
     orgdb("set-status", "--slug", slug, "--status", "analyzing")
     _tlabel = "no limit" if args.timeout <= 0 else f"≤{args.timeout}s"
     print(f"[orch]   ✓ prepped @ {detail} → agent session ({_tlabel})  log: {log}",
@@ -809,6 +813,19 @@ def cleanup(slug: str, env_extra: dict, verify: bool = False):
             pass
 
 
+def fresh_baseline_wipe(slug: str) -> None:
+    """--fresh: remove this repo's durable MODEL (model.json + the derived knowledge
+    docs) so the agent rebuilds it from scratch (BASELINE) instead of resuming the
+    cached model. findings.json is KEPT so new-vs-known reconciliation still works."""
+    kdir = data_root() / "knowledge" / slug
+    for name in ("model.json", "PROJECT.md", "AUTH.md", "ROLES.md",
+                 "ENTRYPOINTS.md", "TRUST_BOUNDARIES.md"):
+        try:
+            (kdir / name).unlink()
+        except OSError:
+            pass   # missing / unremovable — nothing to clear
+
+
 def main():
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -884,6 +901,11 @@ def main():
     ap.add_argument("--agent-subagent-turns", type=int, default=0,
                     help="litellm backend: max tool-use turns per spawned subagent "
                          "(default 40).")
+    ap.add_argument("--fresh", action="store_true",
+                    help="force a BASELINE rebuild: clear this repo's cached model.json "
+                         "+ derived docs before the run so recon re-derives the model "
+                         "(findings.json kept for reconciliation). Use when the model is "
+                         "stale/wrong and an incremental run would keep reusing it.")
     ap.add_argument("--agent-base-url", default="",
                     help="litellm backend: override the model endpoint URL (a "
                          "self-hosted OpenAI-compatible server, Ollama/vLLM, or a "
