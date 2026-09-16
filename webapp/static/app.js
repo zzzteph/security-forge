@@ -28,6 +28,8 @@ createApp({
       settingsMsg: '',
       editing: null, repoForm: null, formErr: '',
       current: null,          // repo detail
+      model: null,            // repo recon model / auth map (knowledge/<slug>/model.json)
+      noteDraft: { kind: 'note', title: '', body: '' },   // notes composer (one surface open at a time)
       finding: null,          // finding detail (advisory)
       scans: [], scanView: null,
       reports: [], reportView: null, reportMsg: '',   // executive reports
@@ -344,8 +346,42 @@ createApp({
       const d = await this.api('GET', '/api/repos/' + r.id);
       this.current = d; this.view = 'repo'; this.finding = null; this.scanView = null;
       this.reportView = null;
+      this.model = null; this.loadModel(r.id).catch(() => {});   // recon model / auth map
       this.loadReports().catch(() => {});   // populate this repo's report list
       if (!skipHash) this.pushHash('#/repo/' + r.id);
+    },
+    async loadModel(id) {
+      try { this.model = await this.api('GET', '/api/repos/' + id + '/model'); }
+      catch (e) { this.model = null; }
+    },
+    authnText(m) { return (m && m.authn && m.authn.mechanism) || '—'; },
+
+    // --- notes (agent leads + operator notes/context; scan/repo/project) -------
+    noteKinds() { return ['needs_verification', 'untraced', 'hardening', 'suggestion', 'context', 'note']; },
+    noteKindLabel(k) { return ({ needs_verification: 'needs verification', untraced: 'untraced', hardening: 'hardening', suggestion: 'suggestion', context: 'context', note: 'note' })[k] || k; },
+    async reloadNotes(scope, refId) {
+      const qs = scope === 'repo' ? ('repo_id=' + refId) : ('scope=' + scope + '&ref_id=' + refId);
+      const d = await this.api('GET', '/api/notes?' + qs);
+      if (scope === 'repo' && this.current) this.current.notes = d.notes;
+      else if (scope === 'scan' && this.scanView) this.scanView.notes = d.notes;
+      else if (scope === 'project' && this.projectForm) this.projectForm.notes = d.notes;
+    },
+    async addNote(scope, refId) {
+      const b = this.noteDraft;
+      if (!(b.body || '').trim() && !(b.title || '').trim()) return;
+      try {
+        await this.api('POST', '/api/notes', { scope, ref_id: refId, kind: b.kind, title: b.title, body: b.body });
+        this.noteDraft = { kind: 'note', title: '', body: '' };
+        await this.reloadNotes(scope, refId);
+      } catch (e) { this.notify(String(e.message || e)); }
+    },
+    async deleteNote(scope, refId, n) {
+      try { await this.api('DELETE', '/api/notes/' + n.uuid); await this.reloadNotes(scope, refId); }
+      catch (e) { this.notify(String(e.message || e)); }
+    },
+    async setNoteStatus(scope, refId, n, status) {
+      try { await this.api('PUT', '/api/notes/' + n.uuid, { status }); await this.reloadNotes(scope, refId); }
+      catch (e) { this.notify(String(e.message || e)); }
     },
     repoReports(repoId) { return (this.reports || []).filter(r => r.repo_id === repoId); },
 
@@ -744,6 +780,71 @@ createApp({
         <div class="muted" style="margin-top:8px">cron {{current.repo.cron||'—'}} · next {{fmt(current.next_run)||'—'}} · {{current.repo.enabled?'enabled':'disabled'}}</div>
         <div v-if="current.repo.context" style="margin-top:8px"><span class="muted">context:</span> {{current.repo.context}}</div>
       </div>
+
+      <!-- MODEL / AUTH MAP: the recon project model surfaced inline (not just a file tree) -->
+      <div class="card" v-if="model">
+        <div class="flex" style="margin-bottom:6px"><h2 style="margin:0">Model &amp; auth map</h2>
+          <span class="spacer"></span>
+          <span v-if="model.exists && model.last_analyzed_commit" class="mono muted" style="font-size:12px">@{{(model.last_analyzed_commit||'').slice(0,8)}}</span>
+          <button class="sm" @click="openArtifacts('knowledge/'+current.repo.slug)">All artifacts</button>
+        </div>
+
+        <div v-if="!model.exists" class="muted" style="font-size:13px">
+          No project model yet — run a baseline scan (<b>Scan now</b>) and recon will derive <span class="mono">model.json</span>.
+          <span v-if="model.docs && model.docs.length"><br>Docs on disk:
+            <a v-for="d in model.docs" :key="d.path" class="chip" @click="openArtifacts(d.path)">{{d.name}}</a>
+          </span>
+        </div>
+
+        <template v-else>
+          <div v-if="model.idea" style="margin-bottom:12px"><span class="muted" style="font-size:12px">Purpose</span><div>{{model.idea}}</div></div>
+
+          <div class="authmap">
+            <div class="am-row"><span class="am-k">AuthN</span><span class="am-v">{{authnText(model)}}</span></div>
+            <div class="am-row"><span class="am-k">AuthZ</span><span class="am-v">{{(model.authz&&model.authz.model)||'—'}}<span v-if="model.authz&&model.authz.object_level"> · object-level: {{model.authz.object_level}}</span></span></div>
+            <div class="am-row" v-if="model.enforced_at&&model.enforced_at.length"><span class="am-k">Enforced at</span><span class="am-v mono" style="font-size:12.5px">{{model.enforced_at.join(' · ')}}</span></div>
+            <div class="am-row" v-if="model.off_repo_enforcement"><span class="am-k" style="color:var(--high)">⚠ off-repo</span><span class="am-v" style="color:var(--high)">Authorization resolves to a gateway / shared middleware — <b>not verifiable from this repo's code</b>. A low finding count here is not completeness; supply the platform auth contract as context to analyze it.</span></div>
+          </div>
+
+          <div v-if="model.authz&&model.authz.gaps&&model.authz.gaps.length" style="margin-top:8px">
+            <span class="muted" style="font-size:12px">Noted auth gaps</span>
+            <ul style="margin:4px 0 0;padding-left:18px">
+              <li v-for="(g,i) in model.authz.gaps" :key="i" style="font-size:13px">{{g}}</li>
+            </ul>
+          </div>
+
+          <div v-if="model.entrypoints&&model.entrypoints.length" style="margin-top:14px">
+            <span class="muted" style="font-size:12px">Entry points ({{model.entrypoints.length}})</span>
+            <table style="margin-top:4px">
+              <thead><tr><th>Method</th><th>Route</th><th>Auth</th><th>Roles</th><th>Object lookup</th></tr></thead>
+              <tbody>
+                <tr v-for="(e,i) in model.entrypoints" :key="i">
+                  <td class="mono nowrap">{{e.method}}</td>
+                  <td class="mono">{{e.route}}</td>
+                  <td><span class="badge" :class="e.auth_required===false?'b-HIGH':(e.auth_required?'b-ok':'')">{{e.auth_required===false?'NONE':(e.auth_required?'yes':'?')}}</span></td>
+                  <td class="muted">{{(e.roles&&e.roles.length)?e.roles.join(', '):'—'}}</td>
+                  <td class="muted">{{e.object_lookup||'—'}}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div v-if="model.roles&&model.roles.length" style="margin-top:14px">
+            <span class="muted" style="font-size:12px">Roles / principals</span>
+            <div style="margin-top:4px">
+              <span v-for="(r,i) in model.roles" :key="i" class="chip" :title="(r.can&&r.can.length)?('can: '+r.can.join(', ')):''">{{r.name||r}}</span>
+            </div>
+          </div>
+
+          <div v-if="model.docs&&model.docs.length" style="margin-top:14px">
+            <span class="muted" style="font-size:12px">Recon docs</span>
+            <div style="margin-top:4px">
+              <a v-for="d in model.docs" :key="d.path" class="chip" @click="openArtifacts(d.path)">{{d.name}}</a>
+            </div>
+          </div>
+        </template>
+      </div>
+
       <div class="card">
         <div class="flex" style="margin-bottom:6px"><h2 style="margin:0">Reports</h2>
           <span v-if="repoReports(current.repo.id).some(r=>['queued','running'].includes(r.status))" class="live" style="font-size:13px"><span class="dot pulse on"></span>generating…</span>
@@ -777,6 +878,34 @@ createApp({
           <td>{{f.title}}</td>
           <td><span class="pill" :class="f.status">{{f.status}}</span></td></tr>
           <tr v-if="!current.findings.length"><td colspan="3" class="muted">No findings recorded yet.</td></tr></tbody></table></div>
+
+      <!-- NOTES & NEEDS-VERIFICATION: leads + operator context, separate from confirmed findings -->
+      <div class="card">
+        <h2 style="margin-top:0">Notes &amp; needs-verification <span class="muted" style="font-weight:400;font-size:13px">— leads &amp; context, not confirmed findings</span></h2>
+        <div v-for="n in (current.notes||[])" :key="n.uuid" class="note" :class="{resolved:n.status!=='open'}">
+          <div class="flex" style="gap:8px;align-items:baseline">
+            <span class="chip nk" :class="'nk-'+n.kind">{{noteKindLabel(n.kind)}}</span>
+            <span class="chip" style="border-style:dashed">{{n.source}}</span>
+            <b v-if="n.title">{{n.title}}</b>
+            <span class="muted" v-if="n.scope==='scan'" style="font-size:11px">scan #{{n.scan_id||n.ref_id}}</span>
+            <span class="spacer"></span>
+            <span class="muted" style="font-size:11px">{{fmt(n.updated||n.created)}}</span>
+            <button class="sm" @click="setNoteStatus('repo',current.repo.id,n,n.status==='open'?'resolved':'open')">{{n.status==='open'?'Resolve':'Reopen'}}</button>
+            <button class="sm danger" @click="deleteNote('repo',current.repo.id,n)">✕</button>
+          </div>
+          <div v-if="n.body" style="white-space:pre-wrap;margin-top:4px">{{n.body}}</div>
+        </div>
+        <div v-if="!(current.notes||[]).length" class="muted" style="font-size:13px">No notes yet — add a lead to verify or a piece of ground-truth context.</div>
+        <div class="noteadd">
+          <div class="flex" style="gap:8px">
+            <select style="width:auto" v-model="noteDraft.kind"><option v-for="k in noteKinds()" :key="k" :value="k">{{noteKindLabel(k)}}</option></select>
+            <input style="flex:1" v-model="noteDraft.title" placeholder="title (optional)">
+          </div>
+          <textarea v-model="noteDraft.body" placeholder="Add a note or needs-verification lead…"></textarea>
+          <button class="primary" @click="addNote('repo',current.repo.id)">Add note</button>
+        </div>
+      </div>
+
       <div class="card"><h2>Scan history</h2><table>
         <thead><tr>
           <th @click="toggleSort('rscan','id')" style="cursor:pointer">#{{caret('rscan','id')}}</th>
@@ -1206,6 +1335,31 @@ createApp({
     placeholder="1. JWT signatures ARE validated against the JWK endpoint (shared auth lib) — do NOT flag missing JWT verification.&#10;2. Authentication is delegated to OKTA; OKTA-protected routes are authenticated.&#10;3. Tenant scoping is enforced by the base repository layer."></textarea>
   <div class="muted" style="font-size:12px;margin-top:6px" v-if="projectForm.repos && projectForm.repos.length">Repos in this project: {{projectForm.repos.map(r=>r.slug).join(', ')}}</div>
   <div class="muted" style="font-size:12px;margin-top:6px">Assign repos to this project from each repo's <b>Edit</b> dialog.</div>
+
+  <div v-if="projectForm.id" style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px">
+    <h2 style="margin:0 0 6px">Notes &amp; context</h2>
+    <div class="muted" style="font-size:12px;margin-bottom:8px">Tracked project notes and ground-truth context (e.g. the platform auth contract) — each with a kind and status, distinct from the free-text instructions above.</div>
+    <div v-for="n in (projectForm.notes||[])" :key="n.uuid" class="note" :class="{resolved:n.status!=='open'}">
+      <div class="flex" style="gap:8px;align-items:baseline">
+        <span class="chip nk" :class="'nk-'+n.kind">{{noteKindLabel(n.kind)}}</span>
+        <span class="chip" style="border-style:dashed">{{n.source}}</span>
+        <b v-if="n.title">{{n.title}}</b><span class="spacer"></span>
+        <button class="sm" @click="setNoteStatus('project',projectForm.id,n,n.status==='open'?'resolved':'open')">{{n.status==='open'?'Resolve':'Reopen'}}</button>
+        <button class="sm danger" @click="deleteNote('project',projectForm.id,n)">✕</button>
+      </div>
+      <div v-if="n.body" style="white-space:pre-wrap;margin-top:4px">{{n.body}}</div>
+    </div>
+    <div v-if="!(projectForm.notes||[]).length" class="muted" style="font-size:13px">No project notes yet.</div>
+    <div class="noteadd">
+      <div class="flex" style="gap:8px">
+        <select style="width:auto" v-model="noteDraft.kind"><option v-for="k in noteKinds()" :key="k" :value="k">{{noteKindLabel(k)}}</option></select>
+        <input style="flex:1" v-model="noteDraft.title" placeholder="title (optional)">
+      </div>
+      <textarea v-model="noteDraft.body" placeholder="e.g. Kong requires one enforcement middleware per JWT issuer; a missing layer = missing authz."></textarea>
+      <button class="primary" @click="addNote('project',projectForm.id)">Add note</button>
+    </div>
+  </div>
+
   <div class="err" v-if="projectErr">{{projectErr}}</div>
   <div class="right flex" style="margin-top:14px;justify-content:flex-end">
     <button @click="projectForm=null">Cancel</button>
@@ -1246,6 +1400,27 @@ createApp({
         <td>{{f.title}}</td><td class="mono muted where">{{f.file}}{{f.line?':'+f.line:''}}</td>
         <td><span class="stwrap"><span class="pill" :class="f.status">{{f.status}}</span>
           <span v-if="f.triage && f.triage!=='unset'" class="tri" :class="'tri-'+f.triage">{{triageShort(f.triage)}}</span></span></td></tr></tbody></table>
+  </div>
+  <h2 style="margin:14px 0 6px">Notes &amp; needs-verification</h2>
+  <div v-for="n in (scanView.notes||[])" :key="n.uuid" class="note" :class="{resolved:n.status!=='open'}">
+    <div class="flex" style="gap:8px;align-items:baseline">
+      <span class="chip nk" :class="'nk-'+n.kind">{{noteKindLabel(n.kind)}}</span>
+      <span class="chip" style="border-style:dashed">{{n.source}}</span>
+      <b v-if="n.title">{{n.title}}</b><span class="spacer"></span>
+      <span class="muted" style="font-size:11px">{{fmt(n.updated||n.created)}}</span>
+      <button class="sm" @click="setNoteStatus('scan',scanView.id,n,n.status==='open'?'resolved':'open')">{{n.status==='open'?'Resolve':'Reopen'}}</button>
+      <button class="sm danger" @click="deleteNote('scan',scanView.id,n)">✕</button>
+    </div>
+    <div v-if="n.body" style="white-space:pre-wrap;margin-top:4px">{{n.body}}</div>
+  </div>
+  <div v-if="!(scanView.notes||[]).length" class="muted" style="font-size:13px">No notes for this scan.</div>
+  <div class="noteadd">
+    <div class="flex" style="gap:8px">
+      <select style="width:auto" v-model="noteDraft.kind"><option v-for="k in noteKinds()" :key="k" :value="k">{{noteKindLabel(k)}}</option></select>
+      <input style="flex:1" v-model="noteDraft.title" placeholder="title (optional)">
+    </div>
+    <textarea v-model="noteDraft.body" placeholder="Add a note or needs-verification lead for this scan…"></textarea>
+    <button class="primary" @click="addNote('scan',scanView.id)">Add note</button>
   </div>
   <h2 style="margin:14px 0 6px">Log</h2>
   <pre class="log" ref="logEl">{{scanView.log||'(no output yet)'}}</pre>

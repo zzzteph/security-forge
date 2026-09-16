@@ -215,10 +215,39 @@ def _migration_0002_reconcile_feature_tables() -> None:
             c.execute("ALTER TABLE repos ADD COLUMN project_id INTEGER")
 
 
+def _migration_0003_notes() -> None:
+    """Notes: agent-surfaced leads (needs_verification / untraced / hardening /
+    suggestion) and operator-authored notes/context, scoped to a scan, a repo, or a
+    project. Kept OUT of the findings table (which is MEDIUM+ confirmed only) so these
+    low-confidence leads and human context have a home without inflating findings."""
+    with connect() as c:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS notes (
+                id INTEGER PRIMARY KEY, uuid TEXT UNIQUE,
+                scope TEXT NOT NULL,            -- scan | repo | project
+                ref_id INTEGER NOT NULL,        -- scan.id | repo.id | project.id
+                repo_id INTEGER,                -- denormalized for repo-page rollup (NULL for project)
+                scan_id INTEGER,                -- the scan that produced an agent note (NULL for operator)
+                kind TEXT NOT NULL DEFAULT 'note',   -- needs_verification|untraced|hardening|suggestion|context|note
+                source TEXT NOT NULL DEFAULT 'operator',  -- agent | operator
+                title TEXT, body TEXT,
+                status TEXT DEFAULT 'open',     -- open | resolved | dismissed
+                dedup_key TEXT, author TEXT,
+                created TEXT, updated TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_notes_scope ON notes(scope, ref_id);
+            CREATE INDEX IF NOT EXISTS idx_notes_repo ON notes(repo_id);
+            CREATE INDEX IF NOT EXISTS idx_notes_dedup ON notes(repo_id, dedup_key);
+            """
+        )
+
+
 _MIGRATIONS = [
     (1, "baseline schema", _migration_0001_baseline),
     (2, "reconcile feature tables (projects, service_cards, reports)",
      _migration_0002_reconcile_feature_tables),
+    (3, "notes (agent leads + operator notes/context)", _migration_0003_notes),
 ]
 SCHEMA_VERSION = _MIGRATIONS[-1][0]
 
@@ -1220,6 +1249,119 @@ def review_hints(f: dict) -> list[dict]:
         seen.add(h["reason"])
         uniq.append(h)
     return uniq[:6]
+
+
+# --- notes (agent leads + operator notes/context; scan/repo/project scoped) -------
+
+NOTE_KINDS = ("needs_verification", "untraced", "hardening", "suggestion", "context", "note")
+NOTE_SCOPES = ("scan", "repo", "project")
+NOTE_STATUS = ("open", "resolved", "dismissed")
+# The agent-produced lead kinds (vs operator context/note) — for filtering/rollup.
+NOTE_AGENT_KINDS = ("needs_verification", "untraced", "hardening", "suggestion")
+
+
+def add_note(scope: str, ref_id: int, body: str, kind: str = "note",
+             title: str | None = None, source: str = "operator",
+             author: str | None = None, repo_id: int | None = None,
+             scan_id: int | None = None, dedup_key: str | None = None) -> dict:
+    if scope not in NOTE_SCOPES:
+        raise ValueError(f"invalid scope '{scope}'")
+    kind = kind if kind in NOTE_KINDS else "note"
+    body = (body or "").strip()
+    title = (title or "").strip() or None
+    if not body and not title:
+        raise ValueError("empty note")
+    uuid = new_uuid()
+    now = _now()
+    with connect() as c:
+        c.execute(
+            "INSERT INTO notes(uuid,scope,ref_id,repo_id,scan_id,kind,source,title,body,"
+            "status,dedup_key,author,created,updated) "
+            "VALUES(?,?,?,?,?,?,?,?,?,'open',?,?,?,?)",
+            (uuid, scope, ref_id, repo_id, scan_id, kind, source, title, body,
+             dedup_key, author, now, now))
+        r = c.execute("SELECT * FROM notes WHERE uuid=?", (uuid,)).fetchone()
+    return dict(r)
+
+
+def list_notes(scope: str | None = None, ref_id: int | None = None,
+               repo_id: int | None = None) -> list[dict]:
+    """Notes for a scope+ref (e.g. one scan or one project). When `repo_id` is given
+    it's the REPO-PAGE ROLLUP: notes attached to the repo itself PLUS agent leads from
+    any of that repo's scans. Operator notes sort first, then newest."""
+    q = "SELECT * FROM notes"
+    where, v = [], []
+    if repo_id is not None:
+        where.append("repo_id=?"); v.append(repo_id)
+    else:
+        if scope:
+            where.append("scope=?"); v.append(scope)
+        if ref_id is not None:
+            where.append("ref_id=?"); v.append(ref_id)
+    if where:
+        q += " WHERE " + " AND ".join(where)
+    q += " ORDER BY (source='operator') DESC, id DESC"
+    with connect() as c:
+        return [dict(r) for r in c.execute(q, tuple(v))]
+
+
+def get_note(uuid: str) -> dict | None:
+    with connect() as c:
+        r = c.execute("SELECT * FROM notes WHERE uuid=?", (uuid,)).fetchone()
+    return dict(r) if r else None
+
+
+def update_note(uuid: str, **kw) -> dict | None:
+    fields = {k: v for k, v in kw.items() if k in ("title", "body", "kind", "status")}
+    if "kind" in fields and fields["kind"] not in NOTE_KINDS:
+        fields.pop("kind")
+    if "status" in fields and fields["status"] not in NOTE_STATUS:
+        fields.pop("status")
+    if not fields:
+        return get_note(uuid)
+    fields["updated"] = _now()
+    sets = ", ".join(f"{k}=?" for k in fields)
+    with connect() as c:
+        c.execute(f"UPDATE notes SET {sets} WHERE uuid=?", (*fields.values(), uuid))
+    return get_note(uuid)
+
+
+def delete_note(uuid: str) -> None:
+    with connect() as c:
+        c.execute("DELETE FROM notes WHERE uuid=?", (uuid,))
+
+
+def record_agent_notes(repo_id: int, slug: str, scan_id: int, notes: list[dict]) -> int:
+    """Ingest a scan's structured leads (needs_verification / untraced / hardening /
+    suggestion) as repo-scoped agent notes. Deduped per repo on (kind|title|body) so a
+    rescan updates the same lead instead of piling up. Operator notes are never touched.
+    Returns the count of NEW notes. (For the scan pipeline to call at record time.)"""
+    n_new = 0
+    now = _now()
+    with connect() as c:
+        for note in notes or []:
+            kind = note.get("kind") or "needs_verification"
+            kind = kind if kind in NOTE_KINDS else "needs_verification"
+            title = (note.get("title") or "").strip() or None
+            body = (note.get("body") or note.get("detail") or "").strip()
+            if not body and not title:
+                continue
+            basis = "|".join([str(repo_id), kind, (title or ""), body]).lower()
+            dk = hashlib.sha1(basis.encode("utf-8", "ignore")).hexdigest()[:16]
+            row = c.execute("SELECT uuid FROM notes WHERE repo_id=? AND dedup_key=? "
+                            "AND source='agent'", (repo_id, dk)).fetchone()
+            if row:
+                c.execute("UPDATE notes SET title=?, body=?, kind=?, scan_id=?, updated=? "
+                          "WHERE uuid=?", (title, body, kind, scan_id, now, row["uuid"]))
+            else:
+                n_new += 1
+                c.execute(
+                    "INSERT INTO notes(uuid,scope,ref_id,repo_id,scan_id,kind,source,title,"
+                    "body,status,dedup_key,created,updated) "
+                    "VALUES(?,?,?,?,?,?,'agent',?,?,'open',?,?,?)",
+                    (new_uuid(), "repo", repo_id, repo_id, scan_id, kind, title, body,
+                     dk, now, now))
+    return n_new
 
 
 def counts() -> dict:

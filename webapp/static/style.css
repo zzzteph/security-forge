@@ -58,6 +58,24 @@ tr:hover td{background:var(--panel2)}
 .pill.open{color:#ff9a9d;border-color:var(--crit)} .pill.mitigated{color:var(--ok);border-color:var(--ok)}
 .pill.running{color:var(--accent)} .pill.done{color:var(--ok)} .pill.error{color:#ff9a9d}
 .pill.queued{color:var(--muted)}
+.b-ok{background:var(--ok);color:#fff}
+/* repo model / auth-map panel */
+.authmap{display:grid;gap:5px;margin-top:2px}
+.am-row{display:flex;gap:10px;align-items:baseline}
+.am-k{flex:0 0 96px;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em}
+.am-v{flex:1;min-width:0}
+.chip{display:inline-block;padding:2px 10px;margin:0 6px 6px 0;border-radius:20px;font-size:12.5px;border:1px solid var(--line);color:var(--muted)}
+a.chip{cursor:pointer;color:var(--accent)}
+/* notes (agent leads + operator notes/context) */
+.note{border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin-bottom:8px}
+.note.resolved{opacity:.5}
+.noteadd{margin-top:10px;border-top:1px solid var(--line);padding-top:10px}
+.noteadd textarea{min-height:58px;margin:6px 0}
+.chip.nk{font-weight:700}
+.nk-needs_verification{border-color:var(--high);color:var(--high)}
+.nk-untraced{border-color:var(--med);color:var(--med)}
+.nk-hardening{border-color:var(--low);color:var(--muted)}
+.nk-context{border-color:var(--accent2);color:var(--accent)}
 
 /* triage disposition chips (on findings) */
 .tri{display:inline-block;margin-left:6px;padding:2px 9px;border-radius:20px;font-size:12px;

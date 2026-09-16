@@ -281,6 +281,7 @@ def project_detail(pid: int, user: str = Depends(require_user)):
     p = db.get_project(pid)
     if not p:
         raise HTTPException(404, "no such project")
+    p["notes"] = db.list_notes(scope="project", ref_id=pid)
     return p
 
 
@@ -332,7 +333,70 @@ def repo_detail(rid: int, user: str = Depends(require_user)):
         raise HTTPException(404, "no such repo")
     return {"repo": r, "findings": db.list_findings(repo_id=rid),
             "scans": db.list_scans(repo_id=rid, limit=50),
+            "notes": db.list_notes(repo_id=rid),
             "next_run": scheduler.next_runs().get(f"repo-{rid}")}
+
+
+# Recon docs the orchestrator writes per repo under knowledge/<slug>/.
+_MODEL_DOCS = ("PROJECT.md", "AUTH.md", "ENTRYPOINTS.md", "ROLES.md",
+               "TRUST_BOUNDARIES.md", "coordinator_coverage.md", "model.json",
+               "findings.json")
+# Tokens in the auth model that mean enforcement lives OUTSIDE this repo (a
+# gateway / mesh / shared middleware) — so a low finding count is NOT completeness.
+_OFF_REPO_AUTH = ("gateway", "kong", "middleware", "smart gateway", "upstream",
+                  "delegated", "mesh", "istio", "envoy", "sidecar", "external")
+
+
+@app.get("/api/repos/{rid}/model")
+def repo_model(rid: int, user: str = Depends(require_user)):
+    """The recon 'project model' for a repo, distilled for the repo page: purpose,
+    auth map (authn/authz + an off-repo-enforcement flag), entry points, roles and
+    trust boundaries — read from knowledge/<slug>/model.json — plus links to the
+    full recon docs. Returns {exists: false} when no baseline has been built yet."""
+    r = db.get_repo(rid)
+    if not r:
+        raise HTTPException(404, "no such repo")
+    slug = r["slug"]
+    kdir = _ART_ROOT / "knowledge" / slug
+    docs = [{"name": n, "path": f"knowledge/{slug}/{n}"}
+            for n in _MODEL_DOCS if (kdir / n).is_file()]
+    model_path = kdir / "model.json"
+    if not model_path.is_file():
+        return {"exists": False, "slug": slug, "docs": docs}
+    try:
+        model = json.loads(model_path.read_text(encoding="utf-8", errors="replace"))
+    except (ValueError, OSError):
+        return {"exists": False, "slug": slug, "docs": docs, "error": "model.json unreadable"}
+    auth = model.get("auth") or {}
+    authn = auth.get("authn") or {}
+    authz = auth.get("authz") or {}
+    eps = []
+    for e in (model.get("entrypoints") or []):
+        if not isinstance(e, dict):
+            continue
+        eps.append({
+            "method": (e.get("method") or e.get("kind") or "").upper(),
+            "route": e.get("route") or e.get("id") or "",
+            "auth_required": e.get("auth_required"),
+            "roles": e.get("roles") or [],
+            "object_lookup": e.get("object_lookup"),
+            "handler": (e.get("handler_file") or "") + (f":{e['line']}" if e.get("line") else ""),
+        })
+    enforced = authz.get("enforced_at")
+    enforced_list = enforced if isinstance(enforced, list) else ([enforced] if enforced else [])
+    blob = " ".join([authn.get("mechanism") or "", authz.get("model") or "",
+                     " ".join(str(x) for x in enforced_list)]).lower()
+    return {
+        "exists": True, "slug": slug,
+        "idea": model.get("idea"), "stack": model.get("stack"),
+        "crown_jewels": model.get("crown_jewels"),
+        "built_commit": model.get("built_commit"),
+        "last_analyzed_commit": model.get("last_analyzed_commit"),
+        "authn": authn, "authz": authz, "enforced_at": enforced_list,
+        "off_repo_enforcement": any(k in blob for k in _OFF_REPO_AUTH),
+        "entrypoints": eps, "roles": model.get("roles") or [],
+        "trust_boundaries": model.get("trust_boundaries"), "docs": docs,
+    }
 
 
 @app.post("/api/repos")
@@ -407,6 +471,7 @@ def scan_detail(sid: int, user: str = Depends(require_user)):
     if not s:
         raise HTTPException(404, "no such scan")
     s["findings"] = db.list_findings_by_scan(sid)
+    s["notes"] = db.list_notes(scope="scan", ref_id=sid)
     return s
 
 
@@ -434,6 +499,61 @@ def delete_scan(sid: int, user: str = Depends(require_user)):
     if s["status"] in ("queued", "running"):
         raise HTTPException(409, "cannot delete a scan that is queued or running")
     db.delete_scan(sid)
+    return {"ok": True}
+
+
+# --- notes (agent leads + operator notes/context; scan/repo/project) --------
+
+@app.get("/api/notes")
+def notes_list(scope: str = "", ref_id: int | None = None, repo_id: int | None = None,
+               user: str = Depends(require_user)):
+    return {"notes": db.list_notes(scope=scope or None, ref_id=ref_id, repo_id=repo_id)}
+
+
+@app.post("/api/notes")
+async def notes_create(request: Request, user: str = Depends(require_user)):
+    b = await request.json()
+    scope = (b.get("scope") or "").strip()
+    if scope not in db.NOTE_SCOPES:
+        raise HTTPException(400, "scope must be scan|repo|project")
+    try:
+        ref_id = int(b.get("ref_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "ref_id required")
+    # derive repo_id (for the repo-page rollup) + scan_id from the scope
+    repo_id, scan_id = None, None
+    if scope == "repo":
+        if not db.get_repo(ref_id):
+            raise HTTPException(404, "no such repo")
+        repo_id = ref_id
+    elif scope == "scan":
+        s = db.get_scan(ref_id)
+        if not s:
+            raise HTTPException(404, "no such scan")
+        repo_id, scan_id = s["repo_id"], ref_id
+    elif scope == "project" and not db.get_project(ref_id):
+        raise HTTPException(404, "no such project")
+    try:
+        return db.add_note(scope, ref_id, b.get("body") or "", kind=b.get("kind") or "note",
+                           title=b.get("title"), source="operator", author=user,
+                           repo_id=repo_id, scan_id=scan_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.put("/api/notes/{uuid}")
+async def notes_update(uuid: str, request: Request, user: str = Depends(require_user)):
+    if not db.get_note(uuid):
+        raise HTTPException(404, "no such note")
+    b = await request.json()
+    return db.update_note(uuid, **{k: b[k] for k in ("title", "body", "kind", "status") if k in b})
+
+
+@app.delete("/api/notes/{uuid}")
+def notes_delete(uuid: str, user: str = Depends(require_user)):
+    if not db.get_note(uuid):
+        raise HTTPException(404, "no such note")
+    db.delete_note(uuid)
     return {"ok": True}
 
 
