@@ -426,6 +426,10 @@ class ClaudeCodeBackend(AgentBackend):
 
     def __init__(self, claude_bin: str):
         self.claude = claude_bin
+        # Claude Code refuses `--dangerously-skip-permissions` under root/sudo. This
+        # scanning container runs as root, so declare it a sandbox to lift that guard
+        # (the whole point here is an already-isolated, permission-bypassed session).
+        self.env = {"IS_SANDBOX": "1"}
 
     def build_command(self, prompt: str, model: str) -> list[str]:
         cmd = [self.claude, "-p", prompt, "--verbose", "--output-format",
@@ -541,7 +545,8 @@ def run_session(prompt: str, env_extra: dict, backend: AgentBackend, model: str,
     Prints a heartbeat every `heartbeat`s. Returns the exit code, or 124 if killed
     at the deadline. Never raises (except a missing agent binary)."""
     cmd = backend.build_command(prompt, model)
-    env = {**os.environ, **env_extra}
+    # a backend may contribute env (e.g. claude-code sets IS_SANDBOX=1 to run as root)
+    env = {**os.environ, **getattr(backend, "env", {}), **env_extra}
     popen_kw = {}
     if os.name == "posix":
         popen_kw["start_new_session"] = True
