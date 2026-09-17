@@ -426,14 +426,35 @@ class ClaudeCodeBackend(AgentBackend):
 
     def __init__(self, claude_bin: str):
         self.claude = claude_bin
-        # Claude Code refuses `--dangerously-skip-permissions` under root/sudo. This
-        # scanning container runs as root, so declare it a sandbox to lift that guard
-        # (the whole point here is an already-isolated, permission-bypassed session).
-        self.env = {"IS_SANDBOX": "1"}
+        # Claude Code refuses `--dangerously-skip-permissions` under root/sudo. The old
+        # IS_SANDBOX=1 escape hatch NO LONGER lifts that guard (2.1.x gates it on
+        # CLAUDE_CODE_BUBBLEWRAP), so as root the CLI aborts in ~5s with 0 turns and the
+        # scan silently falls back to salvaging stale knowledge/ findings. This container
+        # runs as root, so instead we DROP PRIVILEGES for the claude subprocess to a
+        # non-root uid (the root guard is getuid()==0-gated). Everything under /data
+        # (target clone, $HOME/.claude, knowledge/) is world-rwx, so the dropped-priv
+        # agent still reads the code and writes its model/findings.
+        self.env = {"IS_SANDBOX": "1"}   # harmless; retained for older CLIs
+        self.agent_uid = (os.environ.get("SECFORGE_AGENT_UID", "1000") or "").strip()
+
+    def _privdrop_prefix(self) -> list[str]:
+        """`setpriv` prefix to run claude as a non-root uid — only when we ARE root,
+        a non-zero target uid is set, and setpriv exists. No-op off-container / non-root
+        (e.g. a Windows console run), so the flag path is unchanged there."""
+        import shutil
+        try:
+            is_root = hasattr(os, "geteuid") and os.geteuid() == 0
+        except OSError:
+            is_root = False
+        if is_root and self.agent_uid and self.agent_uid != "0" and shutil.which("setpriv"):
+            return ["setpriv", "--reuid", self.agent_uid, "--regid", self.agent_uid,
+                    "--clear-groups"]
+        return []
 
     def build_command(self, prompt: str, model: str) -> list[str]:
-        cmd = [self.claude, "-p", prompt, "--verbose", "--output-format",
-               "stream-json", "--dangerously-skip-permissions"]
+        cmd = self._privdrop_prefix() + [
+            self.claude, "-p", prompt, "--verbose", "--output-format",
+            "stream-json", "--dangerously-skip-permissions"]
         if model:
             cmd += ["--model", model]
         return cmd
