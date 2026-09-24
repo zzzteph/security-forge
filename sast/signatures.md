@@ -433,3 +433,170 @@ user_reachable, entrypoint, lang, why_it_matters}` — **only user-reachable sin
 Non-reachable hits are dropped, not listed. These become the `sast_candidates`
 handed to the analysis agents. Nothing here is a finding until an agent confirms
 the flow.
+
+---
+
+## C/C++ / native memory safety (Layer 0 — native)
+grep finds the dangerous *operation*; the memory-safety-analyzer supplies the
+taint AND the **size/length provenance** and reachability. For native code the
+length/size an attacker controls matters as much as the content — **grep =
+recall (a dangerous op is present); the agent proves the size/length is
+attacker-controlled and the sink is reachable.**
+
+### Untrusted sources (native taint origins) — makes a sink reachable
+```
+# process input — argv / env / stdin
+-e '\b(argv|argc)\b|char\s*\*\s*\*?\s*argv'                  # command-line args
+-e '\bgetenv\(|\bsecure_getenv\('                           # environment
+-e '\b(gets|fgets|getline|getchar)\(|\b(scanf|fscanf)\('    # stdin / console
+# file input
+-e '\b(fread|fgets|read|pread|readv|fscanf)\('              # file / fd reads
+-e '\bmmap\(|\bopen\(\s*[^,)]*O_RDONLY'                     # memory-mapped / opened file
+# network / IPC
+-e '\b(recv|recvfrom|recvmsg)\(|\bread\(\s*(sock|fd|conn|s)\b'  # socket read
+-e '\b(pipe|pipe2|mkfifo)\(|\bshmat\(|\bshmget\(|\bmsgrcv\('    # pipe/FIFO/shared-mem/msg queue
+# length-prefixed / deserialized wire formats
+-e '\b(ntohl|ntohs|ntohll|be32toh|le32toh|be16toh)\('       # an on-wire length/size field
+-e '(ParseFrom|protobuf|msgpack|cbor|flatbuffer|unpack|deserialize)'  # -i  parsed struct/len
+```
+
+### 1. unsafe-api — CWE-676/120
+Banned / foot-gun C string & memory calls.
+```
+-e '\b(strcpy|strcat|sprintf|vsprintf|gets|stpcpy|wcscpy|wcscat)\('  # no bounds at all
+-e '\b(sscanf|scanf|fscanf)\([^;]*%s'                       # %s with no field width
+-e '\b(strncpy|strncat)\('                                  # non-terminating / off-by-one prone
+-e '\balloca\(\s*[^0-9)]'                                   # alloca with a non-constant size
+```
+**Confirm:** dst capacity < src length, or the size arg is not the destination's
+real size (you supply dst size vs src length).
+
+### 2. buffer-overflow — CWE-121 (stack)
+Unbounded write into a fixed-size stack buffer.
+```
+-e '\b(char|unsigned char|uint8_t|wchar_t)\s+\w+\s*\[\s*[0-9A-Za-z_]+\s*\]'  # fixed stack buffer — read what writes it
+-e '\b(memcpy|memmove|strcpy|strcat|sprintf|read|recv|gets)\(\s*&?\w+\s*,'   # copy INTO a local buffer
+-e '\bfor\s*\([^;]*;[^;]*<=?\s*\w+\s*;'                     # copy loop with an input-derived bound
+```
+**Confirm:** the length copied into `buf[N]` is attacker-influenced and not
+clamped to `N` / `sizeof buf`.
+
+### 3. heap-overflow — CWE-122
+Copy length can exceed the heap allocation.
+```
+-e '\b(memcpy|memmove|memset|bcopy|strncpy|strncat)\('     # length-taking copy — check len vs alloc size
+-e '\b(malloc|calloc|realloc)\(\s*\w+\s*\)'                # size from a variable — write may exceed it
+-e '\b\w+\s*\[\s*\w*(idx|i|off|pos|len)\w*\s*\]\s*='       # -i  indexed heap write past the block
+```
+**Confirm:** the copy `len` (or written index) can exceed the size passed to
+`malloc`/`realloc`; length and allocation come from different sources.
+
+### 4. integer-overflow — CWE-190
+Size arithmetic that wraps or truncates before an allocation/copy.
+```
+-e '\b(malloc|calloc|realloc|alloca)\([^)]*[*+][^)]*\)'    # arithmetic inside the size arg
+-e '\b\w+\s*\*\s*sizeof\b|\bsizeof\b[^;]*\*\s*\w+'         # count * sizeof(x)
+-e '\b(int|short|int16_t|int32_t)\s+\w*(len|size|count|n)\b'  # -i  narrow/signed type holding a size_t
+-e '\(\s*(size_t|unsigned)\s*\)\s*\w*len'                  # signed length cast to size_t (negative → huge)
+```
+**Confirm:** an attacker-controlled factor makes the product wrap, or a
+`size_t`/`int` mismatch turns a small/negative value into a huge unsigned size.
+
+### 5. format-string — CWE-134
+The format argument is a variable, not a string literal.
+```
+-e '\b(printf|fprintf|sprintf|snprintf|vprintf|vfprintf|vsnprintf|syslog|dprintf|err|warn)\('  # then check the FORMAT arg
+-e '\bprintf\(\s*\w+\s*\)|\bsyslog\(\s*[^,]*,\s*\w+\s*\)'  # format-position arg is a bare identifier
+```
+**Confirm:** the format-position argument is not a `"..."` literal and reaches
+attacker input (`printf(buf)` where `buf` is tainted).
+
+### 6. oob-read — CWE-125
+Read past the end via an input-derived index / length.
+```
+-e '\w+\s*\[\s*\w*(idx|index|off|pos|len)\w*\s*\]'         # -i  index from a variable — check the bound
+-e '\b(memcpy|memmove|read|write|send)\([^,]*,[^,]*,\s*\w+\s*\)'  # length arg is a variable
+-e '\*\s*\(\s*\w+\s*\+\s*\w+\s*\)'                         # pointer + offset dereference
+```
+**Confirm:** the index/length comes from input and is not checked `< size`
+before the read.
+
+### 7. oob-write — CWE-787 (incl. off-by-one)
+Write past the end / off-by-one.
+```
+-e '\w+\s*\[\s*\w+\s*\]\s*='                               # indexed write — check the index bound
+-e '\bfor\s*\([^;]*;[^;]*<=\s*\w+\s*;'                     # <= loop bound (off-by-one)
+-e '\w+\s*\[\s*\w*(len|size|count|n)\b[^]]*\]\s*=\s*.{0,4}0'  # -i  NUL at buf[len] — is len == sizeof(buf)?
+```
+**Confirm:** the written index can equal or exceed the buffer size
+(`buf[sizeof(buf)]`), or a `<=` loop touches one past the end.
+
+### 8. use-after-free — CWE-416
+Pointer dereferenced after its storage is gone.
+```
+-e '\b(free|delete)\b'                                     # free/delete — is the ptr used again & not NULLed?
+-e '\breturn\s*&\s*\w+'                                    # returning the address of a local
+-e '\b\w+\s*=\s*realloc\(\s*\w+'                           # realloc — is the old pointer value still used?
+-e '\.(erase|clear|pop_back|push_back|insert|resize)\('    # C++ container op that invalidates iterators/refs
+```
+**Confirm:** the freed/realloc'd pointer (or a dangling reference/iterator) is
+read or written after the free, with no reassignment in between.
+
+### 9. double-free — CWE-415
+The same pointer freed twice.
+```
+-e '\b(free|delete)\s*\(?\s*\w+'                           # enumerate frees per pointer / per path
+-e '\bgoto\b|\berror:|\bcleanup:|\bfail:'                  # error-label paths that re-hit a free
+```
+**Confirm:** the same pointer can reach `free`/`delete` on two paths (error path
++ normal path) and is not set to `NULL` between them.
+
+### 10. uninitialized — CWE-457
+Read of memory before it is written.
+```
+-e '\b(int|char|long|short|size_t|struct\s+\w+)\s+\*?\w+\s*;'  # bare local decl with no initializer
+-e '\bmalloc\('                                           # malloc (not calloc) — is the whole buffer written before read?
+-e '\bchar\s+\w+\s*\[\s*\d+\s*\]\s*;'                      # uninitialized fixed buffer
+```
+**Confirm:** the variable/buffer is read on a path before every used byte is
+assigned (partial `read`/`memcpy`, then use of the rest).
+
+### 11. command-injection — CWE-78 (native)
+Shell / process spawned with an attacker-influenced string.
+```
+-e '\b(system|popen)\('                                    # shell command string
+-e '\b(execlp|execvp|execvpe|execl|execle|execv)\('        # exec (PATH-searching / shell variants)
+-e '/bin/(sh|bash)|["'"'"']-c["'"'"']'                     # explicit shell -c invocation
+-e '\b(sprintf|snprintf|strcat|asprintf)\([^;]*(cmd|command|exec|system)'  # -i  building a command string
+```
+**Confirm:** a native taint source (argv/env/recv/file) is concatenated into the
+command or passed to a shell (`system`, `popen`, `sh -c`).
+
+### False-positive filters (native — apply before a candidate becomes a finding)
+A grep hit is a *candidate*. Drop it when a neutralizing step is present on the
+path — and **say which filter you applied**.
+
+- **Bounded API, correct size:** `snprintf`/`strlcpy`/`strlcat` given the true
+  `sizeof(dst)`; `strncpy` with an explicit NUL-termination *and* size `< dst`;
+  `memcpy(dst, src, n)` where `n <= sizeof(dst)` provably.
+- **Length checked first:** the copy/index length is compared against
+  `sizeof(dst)` (or the allocation size) and rejected/clamped **before** the
+  write.
+- **C++ bounds-safe access:** `vec.at(i)` / `s.at(i)`, or an explicit
+  `if (i < v.size())` guard before `operator[]`; `std::span`/`gsl::span` bounds.
+- **Allocation validated:** `malloc`/`realloc` result checked for `NULL` **and**
+  the requested size validated against a sane upper bound before use.
+- **Overflow-checked arithmetic:** `__builtin_mul_overflow`/`__builtin_add_overflow`,
+  an explicit `if (b && a > SIZE_MAX / b)` guard, or a `count > MAX` clamp before
+  the multiply/allocation.
+- **Signedness handled:** the input length is an unsigned type (`size_t`) and is
+  range-checked (`len <= max`), so no negative→huge conversion.
+- **RAII / smart pointers:** ownership held by `std::unique_ptr`/`shared_ptr`/
+  `std::string`/`std::vector` (no manual `free`/`delete`) — neutralizes the UAF /
+  double-free candidate.
+- **Literal format string:** the `printf`-family format arg is a string literal
+  (`"%s"`), not a variable.
+- **Non-reachable source:** the value is a compile-time constant / config literal
+  / not on a path from any `model.json` entry point — not attacker-reachable.
+
+Say **which** filter you applied when you drop a candidate — don't discard silently.

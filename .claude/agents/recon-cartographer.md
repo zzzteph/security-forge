@@ -39,6 +39,17 @@ and which roles it *appears* to allow. Note routers/blueprints/`use()` chains so
 coverage is provable, not sampled. Flag any route registered but with no visible
 auth guard.
 
+**For a C/C++/native library or CLI (no HTTP surface)** the attack surface is
+different — enumerate: the **exported/public API** (public headers, symbols marked
+`visibility("default")` / `EXPORT` / a `.def`/version-map), **parsers and
+input-format handlers** (image/media/protocol/serialization decoders), **network /
+IPC receivers** (`recv`/socket/pipe/shared-memory/`msgrcv`), **`argv`/`stdin`/env**
+handling, and registered **callbacks**. Set `kind` to `api|parser|cli|ipc|format`,
+`auth_required`/`roles` are usually N/A (leave empty/false), and — crucially — for
+each input record **who controls its LENGTH/size**, not just its content (that is
+what the memory-safety-analyzer needs). Here `crown_jewels` = the code that touches
+untrusted bytes (the parsers, the wire decoders).
+
 ### roles  → `ROLES.md`
 The principals and privilege tiers: anonymous, user, staff/moderator, admin,
 service/machine, tenant/org boundaries. For each: how it is represented in code

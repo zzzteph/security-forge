@@ -88,6 +88,50 @@ orchestrator gate it with `pipeline.py verify-poc <id> --dir <bundle>` (exit 0 +
 reproduce it, it is NOT verified — return `could_not_run`/`not_reachable`, not
 `verified`. Return the bundle path so the orchestrator can run the gate.
 
+## Native (C/C++) mode — DEMONSTRATE EXPLOITATION, not just a crash
+For a memory-safety finding there is no HTTP endpoint to probe. Drive the crashing
+input through the **real code path** (never a toy `main` that calls the vulnerable
+function with a hardcoded bad value in isolation — that is the native equivalent of
+the forbidden library harness), and then push as far up the exploitation ladder as
+the bug allows. **Report the highest tier you actually reach — never claim a higher
+one, never inflate a crash to "RCE".**
+
+- **T0 — crash (corruption exists & is reachable).** Build with
+  `-fsanitize=address,undefined -g` (or the repo's shipped fuzz target); feed the
+  input; the ASan/UBSan report names the bug class (`heap-buffer-overflow WRITE`,
+  `use-after-free`, …) and a faulting frame at/along the finding's `file:line`. This
+  is the native analogue of the `[SECFORGE]` log — how you *see* the corruption.
+- **T1 — control of the instruction pointer (deterministic, no mitigation defeat).**
+  Overwrite the code pointer the bug reaches — saved **return address**, a nearby
+  **function pointer / callback**, a C++ **vtable** ptr, or a **GOT** entry — with a
+  sentinel (`0x4141424344454647`) and show the process faults *executing/dereferencing
+  that exact value* (`SIGSEGV ip=0x41414242…`). That proves attacker control of PC.
+- **T2 — command execution ("pop whoami").** A working exploit that redirects control
+  to run a **benign marker command**. Build a **lab target** so the exploit is
+  deterministic and reproducible: compile with mitigations relaxed
+  (`-fno-stack-protector -z execstack -no-pie`) and run with ASLR off via
+  `setarch "$(uname -m)" -R ./app` (unprivileged — no `--privileged` needed). The
+  payload runs `/usr/bin/id` or `whoami`, or drops `/tmp/SECFORGE_PWNED_<id>`;
+  `EXPLOITED ✓` is printed when the harness observes that command's output / the
+  sentinel file. State the exact `lab_config` used — a T2 shown only under relaxed
+  mitigations means "exploitable to RCE under this configuration", not "bypasses
+  production hardening".
+
+**Benign proof, not damage:** a marker command (`id`/`whoami`) or sentinel file only,
+inside the sandbox, `--no-egress`, loopback only — never real shellcode that harms,
+a network callback, or a real target.
+
+For a HIGH/CRITICAL the clean bundle (`poc/<NN>-<slug>/`) is a `Dockerfile` that
+builds the lab target (sanitizer build for T0/T1, mitigations-relaxed build for T2)
+and a `poc.py` that feeds the input, drives the exploit to its declared tier, and
+prints `EXPLOITED ✓` (exit 0) when that tier's proof is observed; gate it with
+`verify-poc` exactly as for web. **A T0/T1 finding is still advisory-worthy** —
+weaponizing to a full shell against a hardened production build may be infeasible
+even when the bug is genuinely critical, so do not suppress a proven controllable
+corruption for lacking a T2 shell; record `exploitation_tier` and let severity follow
+the primitive. (CLI-only: the container/UI deployment cannot build or run, so native
+findings stay static candidates there — the finding-refuter is their check.)
+
 ## Output (final message = return value), JSON only:
 ```json
 {
@@ -100,6 +144,9 @@ reproduce it, it is NOT verified — return `could_not_run`/`not_reachable`, not
       "request": "the exact request/payload sent",
       "instrumentation": "debug lines added (file:line) and what they printed",
       "evidence": "response + [SECFORGE] log excerpt proving (or refuting) the sink fired with tainted input",
+      "exploitation_tier": "native only: T0 (crash/ASan) | T1 (PC control, sentinel in ip) | T2 (command executed) | null",
+      "marker": "native only: what proved the tier — the ASan line, the SIGSEGV ip=0x4141… , or the whoami/id output / sentinel file",
+      "lab_config": "native T2 only: the build/runtime settings used (e.g. -fno-stack-protector -z execstack -no-pie, ASLR off via setarch -R) — so the claim is scoped honestly",
       "poc_bundle_dir": "HIGH/CRITICAL: path to the clean runnable bundle to gate with verify-poc (else null)",
       "poc_bundle_passed": "HIGH/CRITICAL: true only if `verify-poc` on that bundle exited 0 (EXPLOITED ✓); else false/null",
       "severity_adjust": "optional: revised severity + why",

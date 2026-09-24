@@ -150,16 +150,17 @@ python scripts/pipeline.py notify --silent "⏳ <repo>@<sha>: comprehension done
 ```
 Announce: **start** · **comprehension** (entrypoints/roles) · **guardrail**
 (hotspots) · **authz** (candidates) · **dataflow** (candidates) · **logic**
-(invariants/state) · **verifying** (n) · **done** (the §10 summary — emitted as a
-notice, not silent). If running interactively, also keep a short `TodoWrite` plan
-updated.
+(invariants/state) · **memsafe** (native, when c/cpp) · **verifying** (n) · **done**
+(the §10 summary — emitted as a notice, not silent). If running interactively, also
+keep a short `TodoWrite` plan updated.
 
 ### How to run the analysis roles (works with or without installed agents)
 Each analysis role has a **brief** at `$SECFORGE_HOME/.claude/agents/<role>.md`. To
 run a role, spawn a subagent with the Agent tool:
 - **Preferred:** `subagent_type: "<role>"` (recon-cartographer / authz-analyzer /
-  code-analyzer / logic-analyzer / finding-verifier) if that type is available (it
-  will be when Claude runs from this folder or the installed plugin).
+  code-analyzer / logic-analyzer / memory-safety-analyzer / finding-verifier) if that
+  type is available (it will be when Claude runs from this folder or the installed
+  plugin).
 - **Always-works fallback:** `subagent_type: "general-purpose"`, and begin the
   prompt with *"Read `$SECFORGE_HOME/.claude/agents/<role>.md` (substitute the
   absolute path) and follow it exactly as your instructions,"* then add the
@@ -249,6 +250,15 @@ filters*) while ranking: when a neutralizing step is present on the path
 (parameterized query, allowlist, `basename()`, autoescape, `safe_load`, a
 principal-scoped query…), drop the candidate and **name the filter you applied**.
 This is where most noise is meant to die — before an agent spends a cycle on it.
+
+**For native code** (c/cpp in `shape`), also run the **C/C++ / native memory
+safety** section of `sast/signatures.md` (unsafe-api, buffer/heap overflow,
+integer-overflow, format-string, OOB read/write, use-after-free, double-free,
+uninitialized, native command-injection) over the `.c/.cc/.cpp/.h/.hpp` tree, and
+its native false-positive filters (bounded API with correct size, length checked vs
+`sizeof(dst)`, `.at()`, overflow-checked arithmetic, RAII/smart pointers). Rank by
+which sink an attacker-controlled **length/size** reaches, not just content; hand
+the hotspots to the memory-safety-analyzer in Phase D4.
 
 ## 4.5. Phase B2 — The repo-wide id-disclosure index (build ONCE, before authz)
 Spawn **one** `authz-analyzer` with `area: "disclosure-index"`. It does not hunt
@@ -421,6 +431,45 @@ available (CLI runs) a request-sequence PoC can later promote them; in the conta
 **finding-refuter** pass is their independent check. Severity is derived from impact
 (money moved / goods shipped free / payment skipped ⇒ CRITICAL/HIGH), taking the
 lower rating where evidence is missing.
+
+## 6.7. Phase D4 — Memory-safety analysis (C/C++/native, STATIC)
+Run this **whenever `shape` includes c or cpp** (skip entirely for a pure
+web/managed-language repo). Web dataflow (Phase D) and authz (Phase C) don't model
+memory: attacker-controlled **length/size** reaching a copy, index, allocation, or
+`free` is a different bug class. Follow the **memory-safety-analyzer** brief; fan out
+one subagent per native component (a parser/decoder, the wire/protocol handler, IPC,
+`argv` handling), up to `max_memsafe_agents`, in parallel.
+
+Each agent is model-driven — it consumes the native entry points (exported API /
+parsers / IPC / argv) — and traces **content AND size** to memory-unsafe sinks,
+returning findings plus a required **`coverage`** list (one row per entry point/input
+path reviewed, SAFE included). Merge any `model_updates` back into `model.json`.
+
+This pass is **STATIC and read-only** — the agent never builds or runs the target. A
+finding is confirmed like any other (read the code, trace `source(content+size) →
+sink` with a `file:line` per hop, reachable from a **public/exported** entry point
+or documented input format, state the **primitive** — write/read/free/crash — and
+**name the safety mechanism you looked for and found absent**: a bounded API with the
+right size, a length check vs `sizeof(dst)`, an overflow-checked size, `.at()`, or
+RAII/smart pointers). A copy/index/free that any of those already guards is
+`dismissed` (name it); a crash-only issue with no corruption and no remote trigger is
+not a finding. Record keepers with `add-finding` using a native `category`
+(`unsafe-api|buffer-overflow|heap-overflow|integer-overflow|format-string|oob-read|oob-write|use-after-free|double-free|uninitialized|command-injection`),
+`fp_filter_checked` = the safety mechanism you ruled out, and a `poc` that is the
+**crashing input** (the bytes/argv/packet and which field is oversized/negative)
+**plus the exploitation hypothesis** — which code pointer the corruption reaches
+(return address / function pointer / vtable / GOT, or the format-string what-where)
+and the goal of hijacking control to run a benign marker command (`whoami`/`id`).
+Severity follows the primitive: attacker-controlled **write** (overflow/OOB-write/UAF-
+write/`%n`) ⇒ CRITICAL/HIGH; sensitive **OOB/uninitialized read** ⇒ HIGH/MEDIUM;
+crash-only DoS ⇒ MEDIUM at most (drop if local-only). These are reported
+**unverified** (§8): a CLI run can promote them up Phase E's native exploitation
+ladder — **T0** crash (ASan) → **T1** control of the instruction pointer (sentinel in
+`ip`) → **T2** command execution ("pop `whoami`", proven with a benign marker in a
+mitigations-relaxed lab build) — gated by `verify-poc`; record the `exploitation_tier`
+reached and don't suppress a proven T0/T1 corruption for lacking a full T2 shell. In
+the container / UI deployment verification is OFF, so these stay static candidates
+and the **finding-refuter** is their independent check.
 
 ## 7. Phase E — Verify hypotheses in Docker with debug instrumentation
 Only if `verify.enabled`. **Verify EVERY recorded finding on a live environment —
