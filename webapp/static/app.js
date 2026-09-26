@@ -16,10 +16,10 @@ createApp({
       counts: {}, findings: [], findingFilter: { status: 'open', min_sev: '', triage: '' },
       commentDraft: '', triageMsg: '', hideFP: false,
       repos: [], runner: { running: null, queued: 0 },
-      backends: [], backendsHome: '/data/home', authModal: null,
+      backends: [], backendsHome: '', codexHome: '', authModal: null,
       skills: [], skillForm: null, skillErr: '',
       projects: [], projectForm: null, projectErr: '', repoSearch: '',
-      settings: { defaults: { backend: 'litellm', model: '', base_url: '', max_turns: '',
+      settings: { defaults: { backend: 'auto', model: '', base_url: '', max_turns: '',
         temperature: '', timeout: '', agent_cmd: '', agent_output: '', extra_args: '', env: [],
         effort: 'max', fanout: 'forced', max_subagents: 6, subagent_turns: 40 },
         max_concurrent_scans: 1 },
@@ -163,6 +163,7 @@ createApp({
     async loadBackends() {
       const d = await this.api('GET', '/api/backends');
       this.backends = d.backends; this.backendsHome = d.home || this.backendsHome;
+      this.codexHome = d.codex_home || '';
     },
     async loadSettings() {
       const s = await this.api('GET', '/api/settings');
@@ -175,6 +176,9 @@ createApp({
       // Secrets arrive masked by default; _show is a per-row reveal toggle (UI-only).
       s.defaults.env.forEach(e => { e._show = false; });
       this.settings = s;
+    },
+    modelChanged() {
+      this.settings.defaults.backend = 'auto';
     },
     async saveSettings() {
       // Strip UI-only reveal flags so only {key,value} is persisted/sent to scans.
@@ -222,7 +226,7 @@ createApp({
     },
 
     // in-browser authorization terminal (xterm.js <-> PTY over WebSocket)
-    canAuth(b) { return b.available && ['claude-code', 'codex', 'gemini'].includes(b.name); },
+    canAuth(b) { return b.available && b.browser_auth && ['claude-code', 'codex', 'gemini'].includes(b.name); },
     openAuth(b) { this.authModal = b.name; this.$nextTick(() => this.initTerm(b.name)); },
     initTerm(backend) {
       const el = this.$refs.termEl;
@@ -300,19 +304,21 @@ createApp({
         this.notify('A scan is already ' + r.last_status + ' for ' + (r.name || r.slug) + '.');
         return;
       }
-      // Open the per-scan chooser; slider defaults to Medium (index 2), fresh off.
-      this.scanModal = { repo: r, level: 2, fresh: false };
+      // Honor global/backend defaults unless the operator requests an override.
+      this.scanModal = { repo: r, level: 2, fresh: false, useDefault: true };
     },
     effortLabel(level) { return this.EFFORTS[Math.min(Math.max(level, 1), 4) - 1]; },
     async startScan() {
       const m = this.scanModal;
       if (!m) return;
-      const r = m.repo, effort = this.effortLabel(m.level), fresh = !!m.fresh;
+      const r = m.repo, effort = m.useDefault ? '' : this.effortLabel(m.level), fresh = !!m.fresh;
       this.scanModal = null;
       r.last_status = 'queued';   // optimistic: disable the button immediately
       try {
-        await this.api('POST', '/api/repos/' + r.id + '/scan?effort=' + encodeURIComponent(effort) + '&fresh=' + fresh);
-        this.notify('Scan queued for ' + (r.name || r.slug) + ' — ' + effort + ' effort' + (fresh ? ', fresh model' : '') + '.');
+        const query = new URLSearchParams({ fresh: String(fresh) });
+        if (effort) query.set('effort', effort);
+        await this.api('POST', '/api/repos/' + r.id + '/scan?' + query);
+        this.notify('Scan queued for ' + (r.name || r.slug) + ' — ' + (effort || 'configured') + ' effort' + (fresh ? ', fresh model' : '') + '.');
       } catch (e) {
         this.notify(String(e.message || e));
       }
@@ -544,7 +550,16 @@ createApp({
     },
     pdf(url) { window.open(url, '_blank'); },
     fmt(t) { return t ? t.replace('T', ' ').replace('Z', '') : ''; },
-    money(v) { const n = Number(v) || 0; return '$' + (n < 1 && n > 0 ? n.toFixed(3) : n.toFixed(2)); },
+    money(v) { if (v == null) return 'not reported'; const n = Number(v) || 0; return '$' + (n < 1 && n > 0 ? n.toFixed(3) : n.toFixed(2)); },
+    scanTokens(s) {
+      try {
+        const u = JSON.parse(s.usage_json || 'null');
+        if (!u) return '';
+        const n = k => Number(u[k] || 0).toLocaleString();
+        return n('input_tokens') + ' input (' + n('cached_input_tokens') + ' cached) · '
+          + n('output_tokens') + ' output (' + n('reasoning_output_tokens') + ' reasoning)';
+      } catch (_) { return ''; }
+    },
     sevList(by) { return SEV.filter(s => by && by[s]).map(s => s + ':' + by[s]).join('  '); },
     cronText(expr) {
       const s = (expr || '').trim();
@@ -687,7 +702,7 @@ createApp({
         <span class="stat" v-for="s in ['CRITICAL','HIGH','MEDIUM']" :key="s">
           <b><span class="badge" :class="'b-'+s">{{(counts.by_severity||{})[s]||0}}</span></b><span>{{s.toLowerCase()}}</span></span>
         <span class="stat"><b>{{counts.scans||0}}</b><span>scans</span></span>
-        <span class="stat"><b>{{money(counts.cost_usd)}}</b><span>total spend</span></span>
+        <span class="stat"><b>{{money(counts.cost_usd)}}</b><span>reported spend</span></span>
         <div style="float:right;display:flex;gap:8px">
           <button @click="pdf('/api/report.pdf')">Quick PDF (all)</button>
           <button class="primary" @click="go('reports')">Reports →</button>
@@ -1201,7 +1216,7 @@ createApp({
             <button v-if="canAuth(b)" class="sm primary" @click="openAuth(b)">{{b.authorized?'Re-authorize':'Authorize'}} in browser</button>
             <div class="mono muted" style="margin-top:4px">{{b.authorize}}</div></td></tr></tbody></table>
         <div class="muted" style="margin-top:10px">
-          Authorize a CLI backend by logging in <b>inside the container</b> — credentials persist on the data volume at <span class="mono">{{backendsHome}}</span>, so you only do it once. Copy the command above and replace <span class="mono">&lt;container&gt;</span> with your container name (e.g. <span class="mono">docker exec -it security-forge-ui claude</span>). Or provide provider API keys as env vars — per repo (in its form) or to the container. Verification is OFF here — static analysis only.
+          Log in where security-forge runs: your local terminal for a native installation, or inside its container for Docker. Use the command shown above, then refresh this page. Codex reuses its saved login at <span class="mono">{{codexHome}}</span>. A Docker installation uses its own CLI and login; it does not run your host's Codex executable.
         </div>
       </div>
     </div>
@@ -1226,11 +1241,15 @@ createApp({
       <div class="card"><h2>AI configuration — one template for all repositories</h2>
         <div class="muted" style="font-size:12px;margin-bottom:8px">Backend, model, keys and args used for <b>every</b> scan. Repositories only choose what to scan, when, and their context.</div>
         <div class="row">
-          <div><label>Backend</label><select v-model="settings.defaults.backend"><option v-for="b in backends" :key="b.name" :value="b.name">{{b.name}}{{b.available?'':' (not installed)'}}</option></select></div>
-          <div><label>Model</label><input v-model="settings.defaults.model" placeholder="openai/gpt-5, anthropic/claude-..., ollama/llama3"></div></div>
-        <div class="row"><div><label>Base URL</label><input class="mono" v-model="settings.defaults.base_url" placeholder="http://localhost:4000"></div>
+          <div><label>Backend</label><select v-model="settings.defaults.backend"><option value="auto">auto (from model)</option><option v-for="b in backends" :key="b.name" :value="b.name">{{b.name}}{{b.available?'':' (not installed)'}}</option></select></div>
+          <div><label>Model</label><input v-model="settings.defaults.model" @input="modelChanged" :placeholder="settings.defaults.backend==='codex' ? 'Blank = your Codex default model' : 'openai/gpt-5, anthropic/claude-..., ollama/llama3'"></div></div>
+        <div class="muted" style="font-size:13px;margin:8px 0">Editing the model selects automatic routing: GPT/ChatGPT ? local Codex, Opus/Sonnet/Haiku ? Claude Code, other models ? LiteLLM. To use your API endpoint, choose LiteLLM after entering the model. Bare <code>chatgpt</code> uses your Codex default model.</div>
+        <div v-if="settings.defaults.backend==='codex'" class="muted" style="font-size:13px;margin:8px 0">
+          Scans and AI reports use the Codex CLI installed alongside security-forge and its saved login. Clear the model field to use your Codex default, or enter a Codex model ID. Select Provider default effort to use your Codex settings. Token usage appears in the scan details; Codex does not report a dollar cost.
+        </div>
+        <div class="row"><div v-if="settings.defaults.backend==='litellm'"><label>Base URL</label><input class="mono" v-model="settings.defaults.base_url" placeholder="http://localhost:4000"></div>
           <div><label>Timeout — seconds per scan (0 = no limit)</label><input class="mono" v-model="settings.defaults.timeout" placeholder="0"></div></div>
-        <div class="row"><div><label>Max turns</label><input class="mono" v-model="settings.defaults.max_turns" placeholder="500"></div>
+        <div class="row" v-if="settings.defaults.backend==='litellm'"><div><label>Max turns</label><input class="mono" v-model="settings.defaults.max_turns" placeholder="500"></div>
           <div><label>Temperature</label><input class="mono" v-model="settings.defaults.temperature"></div></div>
         <div class="row"><div><label>Reasoning effort (default)</label>
           <select v-model="settings.defaults.effort">
@@ -1239,14 +1258,14 @@ createApp({
             <option value="medium">Medium</option>
             <option value="high">High</option>
             <option value="max">Max</option></select></div>
-          <div><label>Subagent depth (fan-out)</label>
+          <div v-if="settings.defaults.backend==='litellm'"><label>Subagent depth (fan-out)</label>
           <select v-model="settings.defaults.fanout">
             <option value="forced">Forced — recon+authz+dataflow+logic (like Claude)</option>
             <option value="auto">Auto — the model decides</option>
             <option value="off">Off — single flat loop</option></select></div></div>
-        <div class="row"><div><label>Max subagents</label><input class="mono" type="number" min="0" v-model.number="settings.defaults.max_subagents" placeholder="6"></div>
+        <div class="row" v-if="settings.defaults.backend==='litellm'"><div><label>Max subagents</label><input class="mono" type="number" min="0" v-model.number="settings.defaults.max_subagents" placeholder="6"></div>
           <div><label>Turns per subagent</label><input class="mono" type="number" min="1" v-model.number="settings.defaults.subagent_turns" placeholder="40"></div></div>
-        <div class="muted" style="font-size:12px;margin-top:6px">
+        <div class="muted" style="font-size:12px;margin-top:6px" v-if="settings.defaults.backend==='litellm'">
           <b>Timeout</b>: seconds before a scan is stopped — <b>0 = no limit</b> (default; let the scan run to completion). ·
           <b>Max turns</b>: how many tool-use steps the agent may take in one scan; blank = 500. ·
           <b>Base URL</b>: point at a self-hosted/OpenAI-compatible endpoint or LiteLLM proxy. ·
@@ -1280,13 +1299,14 @@ createApp({
   <div class="flex"><h2 style="margin:0">Scan {{scanModal.repo.name||scanModal.repo.slug}}</h2>
     <span class="spacer"></span><button class="sm" @click="scanModal=null">✕</button></div>
   <div style="margin:16px 0 6px"><label style="margin:0">How much effort for this scan?</label></div>
-  <input type="range" min="1" max="4" step="1" v-model.number="scanModal.level" style="width:100%">
+  <label class="switch"><input type="checkbox" v-model="scanModal.useDefault"><span class="track"></span>Use configured effort</label>
+  <input type="range" min="1" max="4" step="1" v-model.number="scanModal.level" :disabled="scanModal.useDefault" style="width:100%">
   <div class="flex" style="justify-content:space-between;font-size:12px;color:var(--muted);margin-top:2px">
     <span :style="scanModal.level==1?'color:var(--accent);font-weight:700':''">Low</span>
     <span :style="scanModal.level==2?'color:var(--accent);font-weight:700':''">Medium</span>
     <span :style="scanModal.level==3?'color:var(--accent);font-weight:700':''">High</span>
     <span :style="scanModal.level==4?'color:var(--accent);font-weight:700':''">Max</span></div>
-  <div style="margin-top:12px;font-size:13px">Selected: <b style="text-transform:capitalize">{{effortLabel(scanModal.level)}}</b>
+  <div style="margin-top:12px;font-size:13px">Selected: <b style="text-transform:capitalize">{{scanModal.useDefault ? 'Configured default' : effortLabel(scanModal.level)}}</b>
     <span class="muted"> — higher = deeper reasoning &amp; more thorough, at higher cost. Global default is <b>{{settings.defaults.effort}}</b>.</span></div>
   <label class="switch" style="margin-top:14px"><input type="checkbox" v-model="scanModal.fresh"><span class="track"></span>Fresh scan — rebuild the model</label>
   <div class="muted" style="font-size:12px;margin-top:4px">Clears this repo's cached <span class="mono">model.json</span> so recon re-derives it (a BASELINE run). Findings are kept for reconciliation. Use when the model looks stale/wrong; otherwise a re-scan reuses the cached model (incremental).</div>
@@ -1392,6 +1412,7 @@ createApp({
     <span v-else>{{scanView.new_count}} new · {{scanView.mitigated_count}} mitigated · {{scanView.total_count}} open · {{money(scanView.cost_usd)}} spent · commit {{(scanView.commit_sha||'').slice(0,8)}}</span>
     <span v-if="scanView.error" class="err" style="margin-left:8px">{{scanView.error}}</span>
   </div>
+  <div v-if="scanTokens(scanView)" class="muted" style="font-size:12px;margin:6px 0">Tokens: {{scanTokens(scanView)}}</div>
   <div v-if="scanView.findings && scanView.findings.length">
     <h2 style="margin:14px 0 6px">Findings in this scan ({{scanView.findings.length}})</h2>
     <table><thead><tr><th>Sev</th><th>Title</th><th>Where</th><th>Status</th></tr></thead>

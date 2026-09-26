@@ -26,6 +26,7 @@ from pathlib import Path
 
 import db
 import reportgen
+from scripts.model_names import select_backend
 
 ROOT = Path(__file__).resolve().parent.parent          # security-forge repo root
 PY = sys.executable or "python"
@@ -187,7 +188,9 @@ def _run_scan(repo_id: int, scan_id: int, effort: str | None = None,
 
     # The AI is ONE global template applied to every scan (backend/model/keys/args).
     # A repository only contributes WHAT to scan and its per-repo context.
-    cfg = db.get_setting("defaults", {}) or {}
+    cfg = dict(db.get_setting("defaults", {}) or {})
+    cfg["backend"] = select_backend(cfg.get("model", ""), cfg.get("backend", ""),
+                                    "litellm", cfg.get("agent_cmd", ""))
     # NOT --silent: the UI streams the orchestrator's live progress (turns, tools,
     # heartbeats) into the scan log so the operator can watch it in real time. A
     # 10s heartbeat (vs the 30s default) makes that stream feel live.
@@ -269,7 +272,8 @@ def _run_scan(repo_id: int, scan_id: int, effort: str | None = None,
     db.update_scan(scan_id, heartbeat=db._now())
     commit = None
     orch_error: str | None = None   # a repo-level failure the orchestrator printed
-    cost = 0.0                      # $ spent, parsed from the orchestrator summary line
+    cost = None if cfg.get("backend") == "codex" else 0.0
+    usage = {}
     buf: list[str] = []
     last_flush = 0.0
 
@@ -286,6 +290,12 @@ def _run_scan(repo_id: int, scan_id: int, effort: str | None = None,
                              errors="replace", env=env, bufsize=1)
         for line in iter(p.stdout.readline, ""):
             buf.append(line)
+            if line.startswith("[orch] usage "):
+                try:
+                    usage = json.loads(line[len("[orch] usage "):])
+                    db.update_scan(scan_id, usage_json=json.dumps(usage))
+                except (ValueError, TypeError):
+                    pass
             m = re.search(r"prepped @ ([0-9a-fA-F]{6,40})", line)
             if m:
                 commit = m.group(1)
@@ -296,6 +306,10 @@ def _run_scan(repo_id: int, scan_id: int, effort: str | None = None,
                 orch_error = line.split("prep failed:", 1)[1].strip().rstrip("\n")
             elif re.search(r"->\s*error\b", line) and orch_error is None:
                 orch_error = "orchestrator reported an error for this repository"
+            elif line.startswith("[orch] done.") and " -> " in line:
+                result_status = line.rsplit(" -> ", 1)[-1].strip()
+                if result_status != "analyzed":
+                    orch_error = f"orchestrator ended with status {result_status}"
             mc = re.search(r"cost=\$([0-9]+(?:\.[0-9]+)?)", line)
             if mc:
                 cost = float(mc.group(1))

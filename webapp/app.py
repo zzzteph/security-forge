@@ -14,12 +14,16 @@ import os
 import secrets
 import shutil
 import sqlite3
+import sys
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, WebSocket
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from scripts import codex_cli
 
 import db
 import reports
@@ -43,7 +47,7 @@ app.add_middleware(SessionMiddleware, secret_key=_secret, https_only=False,
 
 # Sensible defaults for the global AI config. timeout "0" = NO limit (let a scan
 # run to completion) — the default the user asked for.
-DEFAULT_DEFAULTS = {"backend": "litellm", "model": "", "base_url": "", "max_turns": "",
+DEFAULT_DEFAULTS = {"backend": "auto", "model": "", "base_url": "", "max_turns": "",
                     "temperature": "", "timeout": "0", "agent_cmd": "", "agent_output": "",
                     "extra_args": "", "env": [], "effort": "max",
                     "fanout": "forced", "max_subagents": 6, "subagent_turns": 40}
@@ -53,7 +57,7 @@ DEFAULT_DEFAULTS = {"backend": "litellm", "model": "", "base_url": "", "max_turn
 def _startup() -> None:
     # HOME lives on the /data volume so agent-CLI logins persist across restarts.
     try:
-        os.makedirs(os.environ.get("HOME", "/data/home"), exist_ok=True)
+        Path.home().mkdir(parents=True, exist_ok=True)
     except OSError:
         pass
     # Seed the global AI config on first boot (no-timeout default), so scans run
@@ -109,7 +113,7 @@ async def change_password(request: Request, user: str = Depends(require_user)):
 # --- backends / settings ----------------------------------------------------
 
 def _authed(subdir: str) -> bool:
-    d = Path(os.environ.get("HOME", "/data/home")) / subdir
+    d = Path.home() / subdir
     try:
         return d.is_dir() and any(d.iterdir())
     except OSError:
@@ -130,11 +134,16 @@ def _available_backends() -> list[dict]:
         ("gemini", "gemini", ".gemini", "gemini", "or set GEMINI_API_KEY"),
         ("aider", "aider", ".aider", "", "uses provider API keys (env)"),
     ]:
+        if name == "codex":
+            binary = codex_cli.binary()
         avail = shutil.which(binary) is not None
+        in_container = Path("/.dockerenv").exists()
+        auth_command = (f"docker exec -it <container> {cmd}" if in_container else cmd)
         out.append({"name": name, "kind": "CLI", "available": avail,
-                    "authorized": _authed(cfg) if avail else False,
-                    "authorize": (f"docker exec -it <container> {cmd}   ({hint})"
-                                  if cmd else hint),
+                    "authorized": ((codex_cli.authenticated() if name == "codex" else _authed(cfg))
+                                   if avail else False),
+                    "browser_auth": os.name == "posix",
+                    "authorize": (f"{auth_command}   ({hint})" if cmd else hint),
                     "hint": hint})
     return out
 
@@ -142,11 +151,11 @@ def _available_backends() -> list[dict]:
 @app.get("/api/backends")
 def backends(user: str = Depends(require_user)):
     return {"backends": _available_backends(),
-            "home": os.environ.get("HOME", "/data/home")}
+            "home": str(Path.home()), "codex_home": str(codex_cli.home())}
 
 
 # Fixed, whitelisted login commands — the PTY endpoint runs ONLY these.
-_AUTH_CMDS = {"claude-code": ["claude"], "codex": ["codex", "login"], "gemini": ["gemini"]}
+_AUTH_CMDS = {"claude-code": ["claude"], "codex": [codex_cli.binary(), "login"], "gemini": ["gemini"]}
 
 
 @app.websocket("/ws/auth")

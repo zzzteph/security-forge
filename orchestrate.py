@@ -35,6 +35,8 @@ from pathlib import Path
 
 import re
 
+from scripts import codex_cli, model_names
+
 ROOT = Path(__file__).resolve().parent
 PY = sys.executable or "python"
 
@@ -67,23 +69,8 @@ def _looks_local(value: str) -> bool:
 
 
 def normalize_model(m: str) -> str:
-    """Turn a friendly model name into the id the Claude Code CLI accepts.
-    Passes through bare aliases (opus/sonnet/haiku/default) and anything already
-    starting 'claude-'. 'OPUS4.8' -> 'claude-opus-4-8', 'opus5[1m]' ->
-    'claude-opus-5[1m]'. Unknown shapes are returned unchanged."""
-    s = (m or "").strip()
-    if not s:
-        return s
-    low = s.lower().replace(" ", "")
-    if low in {"opus", "sonnet", "haiku", "default"} or low.startswith("claude-"):
-        return s
-    mt = re.match(r"^(opus|sonnet|haiku|fable)[-_.]?(\d+(?:\.\d+)?)?(\[1m\])?$", low)
-    if mt:
-        fam, ver, ctx = mt.group(1), mt.group(2), mt.group(3) or ""
-        if not ver:
-            return fam + ctx
-        return f"claude-{fam}-{ver.replace('.', '-')}{ctx}"
-    return s
+    """Normalize friendly Claude model names without guessing model versions."""
+    return model_names.normalize_claude(m)
 
 
 def _helper_json(script: str, *args):
@@ -360,6 +347,31 @@ class _Progress:
                 f"tok in {_h(self.tin)}/out {_h(self.tout)}{cost}{err}")
 
 
+class _CodexProgress(_Progress):
+    """Use Codex JSONL rather than treating it as Claude stream-json."""
+
+    def __init__(self, path: Path):
+        super().__init__(path)
+        self.events = codex_cli.Events()
+
+    def _feed(self, line: str):
+        try:
+            event = json.loads(line)
+        except (ValueError, TypeError):
+            return
+        if not isinstance(event, dict):
+            return
+        self.events.feed(event)
+        self.turns, self.tools = self.events.turns, self.events.tools
+        self.tin, self.tout = self.events.input_tokens, self.events.output_tokens
+        self.cache = self.events.cached_input_tokens
+        self.last, self.err = self.events.last, self.events.error
+
+    def summary(self) -> str:
+        return (super().summary() + f" cached input={self.cache}"
+                f" reasoning output={self.events.reasoning_output_tokens}")
+
+
 class _TextProgress:
     """Fallback progress reader for a backend whose log is plain text (or a JSON
     shape we don't parse): count lines/bytes and echo the latest non-empty line.
@@ -407,6 +419,7 @@ class AgentBackend:
     default; `cli-adapter` wraps any other headless agentic CLI via a template."""
 
     name = "base"
+    stdin_prompt = False
 
     def build_command(self, prompt: str, model: str) -> list[str]:
         raise NotImplementedError
@@ -467,6 +480,32 @@ class ClaudeCodeBackend(AgentBackend):
 
     def missing_hint(self, binary: str) -> str:
         return (f"'{binary}' not found — install Claude Code or pass --claude <path>.")
+
+
+class CodexBackend(AgentBackend):
+    """Run the installed Codex CLI using its existing login and local config."""
+
+    name = "codex"
+    stdin_prompt = True
+
+    def __init__(self, executable=None, effort="", sandbox="workspace-write", output_file=None):
+        self.executable, self.effort, self.sandbox = executable, effort, sandbox
+        self.output_file = output_file
+
+    def build_command(self, prompt: str, model: str) -> list[str]:
+        directories = [data_root(), os.environ.get("SECFORGE_REPORTS_DIR")]
+        return codex_cli.command(model, self.effort, self.executable, self.sandbox,
+                                 writable_dirs=directories, output_file=self.output_file)
+
+    def normalize_model(self, model: str) -> str:
+        return model_names.normalize_codex(model)
+
+    def progress(self, log_path: Path):
+        return _CodexProgress(log_path)
+
+    def missing_hint(self, binary: str) -> str:
+        return (f"'{binary}' not found — install the Codex CLI and run codex login "
+                "on this machine, or set CODEX_BIN / --codex to its executable.")
 
 
 class CliAdapterBackend(AgentBackend):
@@ -574,6 +613,14 @@ def run_session(prompt: str, env_extra: dict, backend: AgentBackend, model: str,
     else:
         popen_kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     log = open(log_path, "w", encoding="utf-8", errors="replace")
+    prompt_input = None
+    if backend.stdin_prompt:
+        # Avoid Windows argv length limits and blocking on a full stdin pipe.
+        import tempfile
+        prompt_input = tempfile.TemporaryFile()
+        prompt_input.write(prompt.encode("utf-8"))
+        prompt_input.seek(0)
+        popen_kw["stdin"] = prompt_input
     try:
         p = subprocess.Popen(cmd, cwd=str(ROOT), stdout=log,
                              stderr=subprocess.STDOUT, env=env, **popen_kw)
@@ -581,6 +628,9 @@ def run_session(prompt: str, env_extra: dict, backend: AgentBackend, model: str,
         log.close()
         print(f"[orch] FATAL: {backend.missing_hint(cmd[0])}", file=sys.stderr)
         raise SystemExit(2)
+    finally:
+        if prompt_input is not None:
+            prompt_input.close()
     start = time.monotonic()
     prog = backend.progress(log_path)
     rc = None
@@ -609,6 +659,10 @@ def run_session(prompt: str, env_extra: dict, backend: AgentBackend, model: str,
     prog.update()   # fold in whatever the session emitted since the last poll
     if not quiet:
         print(f"[orch]     -> {prog.summary()}", flush=True)
+        if isinstance(prog, _CodexProgress):
+            print("[orch] usage " + json.dumps(prog.events.usage()), flush=True)
+    if isinstance(prog, _CodexProgress) and (prog.err or not prog.events.completed) and rc == 0:
+        return 1
     return rc
 
 
@@ -649,25 +703,20 @@ def agent_config() -> dict:
 
 
 def resolve_backend(args, cfg: dict) -> AgentBackend:
-    """Pick the backend to run every session. Precedence: CLI flag > config.agent >
-    default 'claude-code'. Beyond the two built-ins, `name` may select a NAMED
-    PRESET from `config.yaml agent.backends.<name>` — your registry of agent
-    'types' (codex / gemini / aider / a local model via LiteLLM-backed CLI, …),
-    each a command template + output format. `--model` fills the template's
-    `{model}`, so `--backend codex --model gpt-5` just works."""
-    # Precedence: explicit --backend wins; else a CLI --agent-cmd implies the ad-hoc
-    # cli-adapter (a command line signal beats the config default, so you can specify
-    # a whole backend inline without touching config.yaml); else config; else default.
-    if args.backend:
-        name = args.backend.strip()
-    elif args.agent_cmd:
-        name = "cli-adapter"
-    else:
-        name = (cfg.get("backend") or "claude-code").strip()
+    """Explicit backend/command > model family > configured default."""
+    name = model_names.select_backend(
+        getattr(args, "model", "") or cfg.get("model", ""),
+        args.backend.strip(), cfg.get("backend") or "claude-code", args.agent_cmd)
     presets = cfg.get("backends") or {}
 
     if name == "claude-code":
         return ClaudeCodeBackend(args.claude)
+
+    if name == "codex" and not args.agent_cmd:
+        ccfg = cfg.get("codex") or {}
+        return CodexBackend(getattr(args, "codex", None) or ccfg.get("binary"),
+                            args.agent_effort or ccfg.get("effort") or "",
+                            ccfg.get("sandbox") or "workspace-write")
 
     if name == "litellm":
         lc = cfg.get("litellm") or {}
@@ -685,7 +734,7 @@ def resolve_backend(args, cfg: dict) -> AgentBackend:
         subturns = int(args.agent_subagent_turns or lc.get("subagent_turns") or 40)
         return LiteLLMBackend(mt, temp, mct, base, effort, fanout, subs, subturns)
 
-    if name == "cli-adapter":
+    if name == "cli-adapter" or (name == "codex" and args.agent_cmd):
         cli = cfg.get("cli") or {}
         template = (args.agent_cmd or cli.get("command") or "").strip()
         output = (args.agent_output or cli.get("output") or "text").strip()
@@ -694,7 +743,7 @@ def resolve_backend(args, cfg: dict) -> AgentBackend:
         template = (args.agent_cmd or preset.get("command") or "").strip()
         output = (args.agent_output or preset.get("output") or "text").strip()
     else:
-        known = ", ".join(["claude-code", "cli-adapter", *sorted(presets)])
+        known = ", ".join(["claude-code", "codex", "litellm", "cli-adapter", *sorted(presets)])
         print(f"[orch] FATAL: unknown --backend '{name}' (available: {known})",
               file=sys.stderr)
         raise SystemExit(2)
@@ -888,11 +937,12 @@ def main():
     ap.add_argument("--claude", default=os.environ.get("CLAUDE_BIN", "claude"),
                     help="path to the Claude Code CLI (default: claude); used by "
                          "the claude-code backend")
+    ap.add_argument("--codex", default=None,
+                    help="path to the local Codex CLI (otherwise CODEX_BIN or PATH)")
     ap.add_argument("--backend", default="",
-                    help="which agent runs each session: 'claude-code' (default) or "
-                         "'cli-adapter' to wrap any headless agentic CLI (OpenAI "
-                         "Codex, Gemini CLI, aider, …). Overrides config.yaml "
-                         "agent.backend.")
+                    help="which agent runs each session: auto, claude-code, codex, litellm, or "
+                         "cli-adapter for another headless CLI. Overrides config.yaml "
+                         "agent.backend. If omitted, infer from the model first.")
     ap.add_argument("--agent-cmd", default="",
                     help="cli-adapter: command TEMPLATE with {prompt} and {model} "
                          "placeholders, e.g. \"codex exec --model {model} "
@@ -914,9 +964,9 @@ def main():
     ap.add_argument("--agent-temperature", type=float, default=None,
                     help="litellm backend: sampling temperature (provider default if unset)")
     ap.add_argument("--agent-effort", default="",
-                    help="litellm backend: reasoning level low|medium|high|max, mapped per "
-                         "model (Anthropic output_config.effort; others reasoning_effort). "
-                         "Default 'max'.")
+                    help="reasoning level low|medium|high|max. LiteLLM maps per model "
+                         "(default max); Codex uses local config unless specified, "
+                         "with max mapped to high. 'off' preserves the provider default.")
     ap.add_argument("--agent-fanout", default="",
                     help="litellm backend: subagent depth strategy forced|auto|off "
                          "(default 'forced' - deterministically spawns recon+authz+"
@@ -1001,9 +1051,9 @@ def main():
             continue
         k, v = kv.split("=", 1)
         args._agent_env[k.strip()] = v
-    args._backend = resolve_backend(args, acfg)
     if not args.model:
         args.model = (acfg.get("model") or "").strip()
+    args._backend = resolve_backend(args, acfg)
     if args.model:
         norm = args._backend.normalize_model(args.model)
         if norm != args.model:

@@ -103,10 +103,13 @@ Default is **Claude Code**; you can point it at any other headless agentic CLI.
   so any LiteLLM model works directly — `openai/gpt-5`, `gemini/gemini-2.5-pro`,
   `anthropic/claude-3-7-sonnet`, `ollama/llama3`, a local endpoint. Needs
   `pip install litellm`; keys come from the env / `--agent-env`.
+- **codex** — run the installed Codex CLI with its saved login and model settings.
+  Native JSONL progress includes input, cached input and output tokens. Leave the
+  model blank to use your Codex default. See [local Codex setup](CODEX.md).
 - **cli-adapter** — wrap any headless agentic CLI from a command TEMPLATE with
   `{prompt}` and `{model}` placeholders (no shell; `{prompt}` stays one argument).
 - **named presets** — define your agent "types" once in `config.yaml` under
-  `agent.backends.<name>` (examples ship for `codex`, `gemini`, `aider`) and select
+  `agent.backends.<name>` (examples ship for `gemini`, `aider`) and select
   one by name.
 
 ```bash

@@ -53,6 +53,12 @@ Published to GHCR on every push: `ghcr.io/zzzteph/security-forge:latest`
 
 ## Provider keys
 
+For the **codex** backend, select it in Settings and use the installed CLI's
+saved login. Leave Model blank and choose Provider default effort to reuse your
+Codex configuration. Scans and AI report generation both support this backend;
+no LiteLLM API key is needed. See [local Codex setup](../docs/CODEX.md) for native
+and Docker login instructions and token accounting.
+
 Pass the key(s) for your chosen backend as env vars: `OPENAI_API_KEY`,
 `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, or `SECFORGE_LLM_API_KEY` (generic, for a
 custom endpoint). `GITHUB_TOKEN` for private repos. Set `SECFORGE_UI_SECRET` to keep

@@ -96,7 +96,7 @@ python orchestrate.py --org OWNER --backend litellm --model openai/gpt-5 \
   --agent-env OPENAI_API_KEY=sk-...                         # native LiteLLM (no external CLI)
 python orchestrate.py --path ./app --backend litellm --model ollama/llama3 \
   --agent-base-url http://localhost:11434                   # fully local model, offline
-python orchestrate.py --org OWNER --backend codex --model gpt-5   # wrap the Codex CLI (preset)
+python orchestrate.py --org OWNER --backend codex                # local Codex CLI + saved login/model
 python orchestrate.py --repo <url> \
   --agent-cmd "aider --model {model} --yes --message {prompt}" --model gpt-5   # any CLI, inline
 
@@ -107,6 +107,11 @@ python orchestrate.py --org OWNER --output-dir /data/sf \
 # Browse everything found, across all projects, in one place:
 cat /data/security-reports/INDEX.txt
 ```
+
+To use your installed Codex CLI, run `codex login` once, then select
+`--backend codex`. Leave the model blank to use your Codex settings. Scans and
+dashboard AI reports can both use Codex, with token usage in scan details.
+See [local Codex setup](docs/CODEX.md).
 
 Every finding across every project is also collected into one flat, plain-text
 folder — `reports/<date>_<project>_<severity>_<issue>.txt` plus a greppable

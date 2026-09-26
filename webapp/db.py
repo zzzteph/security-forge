@@ -243,11 +243,19 @@ def _migration_0003_notes() -> None:
         )
 
 
+def _migration_0004_scan_usage() -> None:
+    with connect() as c:
+        columns = {r["name"] for r in c.execute("PRAGMA table_info(scans)")}
+        if "usage_json" not in columns:
+            c.execute("ALTER TABLE scans ADD COLUMN usage_json TEXT")
+
+
 _MIGRATIONS = [
     (1, "baseline schema", _migration_0001_baseline),
     (2, "reconcile feature tables (projects, service_cards, reports)",
      _migration_0002_reconcile_feature_tables),
     (3, "notes (agent leads + operator notes/context)", _migration_0003_notes),
+    (4, "scan token usage", _migration_0004_scan_usage),
 ]
 SCHEMA_VERSION = _MIGRATIONS[-1][0]
 

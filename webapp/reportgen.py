@@ -25,6 +25,7 @@ import os
 
 import db
 import reports
+from scripts.model_names import select_backend, normalize_codex
 
 # Triage dispositions that should NOT appear as live risk in a shareable report.
 _EXCLUDE_TRIAGE = {"false_positive", "duplicate"}
@@ -86,11 +87,15 @@ def _compact(f: dict) -> dict:
 
 
 def _llm_narrative(findings: list[dict], scope: str, context: str,
-                   triage_ctx: str, cfg: dict) -> tuple[str, str, float]:
+                   triage_ctx: str, cfg: dict) -> tuple[str, str, float | None]:
     """Return (narrative_markdown, model_used, cost_usd). Raises on misconfig /
     transport error so the caller can mark the report 'error' with the reason."""
+    cfg = dict(cfg)
+    cfg["backend"] = select_backend(cfg.get("model", ""), cfg.get("backend", ""), "litellm")
     model = (cfg.get("model") or "").strip()
-    if not model:
+    if cfg["backend"] == "codex":
+        model = cfg["model"] = normalize_codex(model)
+    if not model and cfg.get("backend") != "codex":
         raise RuntimeError("No AI model is configured. Set a LiteLLM model in "
                            "Settings → AI configuration (e.g. openai/gpt-5, "
                            "anthropic/claude-sonnet-5, gemini/gemini-2.5-pro).")
@@ -117,6 +122,9 @@ def _llm_narrative(findings: list[dict], scope: str, context: str,
     }
     user = ("Write the report for this scope. Findings and context follow as JSON.\n\n"
             + json.dumps(payload, ensure_ascii=False, indent=2))
+
+    if cfg.get("backend") == "codex":
+        return _codex_narrative(user, cfg)
 
     import litellm
     litellm.drop_params = True
@@ -148,6 +156,37 @@ def _llm_narrative(findings: list[dict], scope: str, context: str,
     except Exception:  # noqa: BLE001  (cost is best-effort)
         cost = 0.0
     return text, kwargs["model"], cost
+
+
+def _codex_narrative(user: str, cfg: dict) -> tuple[str, str, None]:
+    """Generate reports through the same local Codex login used for scans."""
+    import tempfile
+    from pathlib import Path
+    import orchestrate
+
+    ccfg = orchestrate.agent_config().get("codex") or {}
+    model = (cfg.get("model") or "").strip()
+    timeout = int(cfg.get("timeout") or 0)
+    db.DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="codex-report-", dir=db.DATA_ROOT) as work:
+        output = Path(work) / "narrative.md"
+        log = Path(work) / "events.jsonl"
+        backend = orchestrate.CodexBackend(
+            ccfg.get("binary"), cfg.get("effort") or ccfg.get("effort") or "",
+            sandbox="read-only", output_file=output)
+        prompt = (_SYSTEM + "\n\nWrite only the report narrative. All necessary data is "
+                  "below; do not run commands or read or modify files.\n\n" + user)
+        rc = orchestrate.run_session(prompt, {}, backend, model, timeout, log, quiet=True)
+        if rc:
+            progress = backend.progress(log)
+            progress.update()
+            raise RuntimeError(f"Codex report failed (exit {rc}): "
+                               f"{progress.err or progress.last}")
+        text = output.read_text(encoding="utf-8").strip() if output.exists() else ""
+        if not text:
+            raise RuntimeError("Codex returned an empty report.")
+        # CLI usage does not contain a dollar price (e.g. ChatGPT login).
+        return text, model or "Codex configured default", None
 
 
 def _assemble(narrative: str, findings: list[dict]) -> str:

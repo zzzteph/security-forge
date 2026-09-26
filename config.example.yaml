@@ -20,9 +20,11 @@ agent:
   #   claude-code   Claude Code CLI (default)
   #   litellm       NATIVE, no external CLI — our own tool loop over LiteLLM, so any
   #                 LiteLLM model works directly (needs `pip install litellm`)
+  #   codex         installed Codex CLI; reuses its saved login and default model
   #   cli-adapter   wrap an ad-hoc headless agentic CLI (see cli: below)
-  #   <preset>      any name under `backends:` (codex / gemini / aider examples)
-  backend: claude-code           # claude-code | litellm | cli-adapter | <preset>
+  #   <preset>      any name under `backends:` (gemini / aider examples)
+  # Without --backend, recognized model names select Codex or Claude Code first.
+  backend: claude-code           # claude-code | codex | litellm | cli-adapter | <preset>
   model: ""                      # default model; claude-code normalizes (opus4.8 -> claude-opus-4-8),
                                  # everything else verbatim. For litellm use a LiteLLM string,
                                  # e.g. openai/gpt-5, gemini/gemini-2.5-pro, anthropic/claude-3-7-sonnet, ollama/llama3
@@ -37,19 +39,23 @@ agent:
                                  # Key stays in the env: OPENAI_API_KEY, or SECFORGE_LLM_API_KEY for a
                                  # generic endpoint. (CLI: --agent-base-url)
 
+  # Local Codex: run `codex login` in the same environment as security-forge.
+  # Leave agent.model blank to use Codex's own default. CODEX_HOME is inherited.
+  codex:
+    binary: ""                  # optional executable path; otherwise CODEX_BIN / PATH
+    effort: ""                  # blank = Codex config; low | medium | high (max maps to high)
+    sandbox: workspace-write    # the output folders are also granted write access
+
   # Ad-hoc wrapper for one-off use: `--backend cli-adapter` runs this template.
   cli:
     command: ""                  # e.g. "codex exec --model {model} --dangerously-bypass-approvals-and-sandbox {prompt}"
     output: text                 # text (tail the log) | jsonl (parse Claude-style stream-json events)
 
   # NAMED PRESETS — your registry of agent "types". Select one with `--backend <name>`
-  # (e.g. `--backend codex --model gpt-5`). {prompt} and {model} are substituted;
+  # (e.g. `--backend gemini --model gemini-2.5-pro`). {prompt} and {model} are substituted;
   # {prompt} stays a single argv element (no shell), provider keys come from .env.
   # These are EXAMPLES — adjust the exact flags to the CLI/version you have installed.
   backends:
-    codex:                       # OpenAI Codex CLI (headless); model e.g. gpt-5, o4-mini
-      command: "codex exec --model {model} --dangerously-bypass-approvals-and-sandbox {prompt}"
-      output: jsonl
     gemini:                      # Google Gemini CLI; model e.g. gemini-2.5-pro
       command: "gemini -m {model} --yolo -p {prompt}"
       output: text
